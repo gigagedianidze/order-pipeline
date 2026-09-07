@@ -115,3 +115,5 @@ Following the 13-day plan in [PLAN.md](PLAN.md).
   being committed past
 - **Day 5** — graceful shutdown: stop fetching, drain in-flight writes, commit, leave the
   group, close the pool — with a 15s deadline and a hard-exit fallback; services containerised
+- **Day 6** — retries with full jitter, SQLSTATE-based transient/poison classification, and a
+  dead-letter queue: survived a 31s database outage with 0 lost and 0 dead-lettered

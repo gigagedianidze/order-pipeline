@@ -20,6 +20,7 @@ import (
 	"github.com/gigagedianidze/order-pipeline/internal/broker"
 	"github.com/gigagedianidze/order-pipeline/internal/config"
 	"github.com/gigagedianidze/order-pipeline/internal/order"
+	"github.com/gigagedianidze/order-pipeline/internal/retry"
 	"github.com/gigagedianidze/order-pipeline/internal/store"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -29,6 +30,15 @@ import (
 // before SIGKILL, so the service's own deadline must be set against whatever
 // grace period the orchestrator allows (this stack sets 30s).
 const shutdownDeadline = 15 * time.Second
+
+// counters is the worker's running tally, reported by the heartbeat and on exit.
+type counters struct {
+	processed  atomic.Int64
+	duplicates atomic.Int64
+	retries    atomic.Int64
+	dlq        atomic.Int64
+	paused     atomic.Int64
+}
 
 func main() {
 	cfg := config.Load()
@@ -67,10 +77,18 @@ func main() {
 		log.Error("start consumer", "err", err)
 		os.Exit(1)
 	}
+
+	dlq, err := broker.NewDLQ(cfg.KafkaBrokers, cfg.KafkaDLQTopic, log)
+	if err != nil {
+		log.Error("start dlq producer", "err", err)
+		os.Exit(1)
+	}
+
 	log.Info("joining group", "group", cfg.KafkaGroupID, "topic", cfg.KafkaTopic)
 
-	var processed, duplicates, paused atomic.Int64
-	go heartbeat(fetchCtx, log, owned, &processed, &duplicates, &paused)
+	var c counters
+	policy := retry.DefaultPolicy()
+	go heartbeat(fetchCtx, log, owned, &c)
 
 	// A shutdown that hangs is worse than one that is abrupt: the container is
 	// killed anyway, but later and less predictably. Once the signal arrives the
@@ -104,21 +122,18 @@ func main() {
 				if workCtx.Err() != nil {
 					return // deadline exceeded; the watchdog is about to exit
 				}
-				ok := handle(workCtx, db, log, rec, &processed, &duplicates)
+				ok := handle(workCtx, db, dlq, log, rec, policy, &c)
 				if !ok {
-					// Stop at the first failure in this partition AND pause it.
+					// Retries and the dead-letter queue have both failed, so this
+					// record can neither be persisted nor parked. Stop the
+					// partition and pause it.
 					//
-					// Stopping alone is not enough: the client's fetch position has
-					// already moved past this record, so the next poll would deliver
-					// the records behind it, succeed, and commit an offset beyond
-					// the failure — silently losing it. Measured: a failed record at
-					// offset 20 ended with the group committed at 22 and lag 0.
-					//
-					// Pausing stops fetching this partition entirely, so nothing
-					// behind the failure is processed or committed. The offset stays
-					// uncommitted, so the record is redelivered on the next
-					// rebalance or restart. Day 6 replaces the indefinite pause with
-					// bounded retries and a dead-letter queue.
+					// Stopping alone would not be enough: the client's fetch
+					// position has already moved past this record, so the next poll
+					// would deliver the records behind it, succeed, and commit an
+					// offset beyond the failure — silently losing it. Measured
+					// before the pause existed: a failed record at offset 20 ended
+					// with the group committed at 22 and lag 0.
 					blocked = append(blocked, rec.Partition)
 					return
 				}
@@ -132,10 +147,10 @@ func main() {
 
 		if len(blocked) > 0 {
 			client.PauseFetchPartitions(map[string][]int32{cfg.KafkaTopic: blocked})
-			paused.Add(int64(len(blocked)))
-			log.Warn("partition paused after write failure",
+			c.paused.Add(int64(len(blocked)))
+			log.Warn("partition paused: could not persist and could not dead-letter",
 				"partitions", blocked,
-				"effect", "no further records from these partitions until the failure is resolved")
+				"effect", "no further records from these partitions until Kafka is reachable")
 		}
 
 		if len(committable) == 0 {
@@ -159,19 +174,124 @@ func main() {
 	//   3. leave the group      — Close() sends LeaveGroup, so the remaining
 	//                             members rebalance immediately instead of
 	//                             waiting out the 45s session timeout
-	//   4. close the database pool
+	//   4. close the producers and the database pool
 	//
 	// Reversing 2 and 3 would hand the partitions to another member while this
 	// one still had uncommitted writes in progress: duplicate work at best.
 	log.Info("draining complete, leaving group",
-		"processed_total", processed.Load(),
-		"duplicates_total", duplicates.Load())
+		"processed_total", c.processed.Load(),
+		"duplicates_total", c.duplicates.Load())
 
 	client.Close() // blocks until LeaveGroup is acknowledged
+	dlq.Close()
 	db.Close()
 
 	log.Info("stopped cleanly",
-		"processed_total", processed.Load(), "duplicates_total", duplicates.Load())
+		"processed_total", c.processed.Load(),
+		"duplicates_total", c.duplicates.Load(),
+		"retries_total", c.retries.Load(),
+		"dlq_total", c.dlq.Load())
+}
+
+// handle processes one record and reports whether the offset may advance past it.
+//
+// It returns false only when the worker genuinely cannot make progress — which,
+// after retries and the dead-letter queue, means Kafka itself is unreachable.
+// Every other outcome, including permanent failure, ends with the record
+// accounted for and the partition free to move on.
+func handle(ctx context.Context, db *store.Store, dlq *broker.DLQ, log *slog.Logger,
+	rec *kgo.Record, policy retry.Policy, c *counters) bool {
+
+	var evt order.Event
+	if err := json.Unmarshal(rec.Value, &evt); err != nil {
+		// Poison by definition: no amount of retrying will make this parse.
+		return deadLetter(ctx, dlq, log, rec, broker.ReasonPoison, err, 0, c)
+	}
+
+	attempts := 0
+	err := retry.Do(ctx, policy, store.IsRetryable,
+		func(attempt int, delay time.Duration, err error) {
+			c.retries.Add(1)
+			log.Warn("write failed, retrying",
+				"attempt", attempt+1,
+				"delay", delay,
+				"partition", rec.Partition, "offset", rec.Offset,
+				"order_id", evt.OrderID, "err", err)
+		},
+		func() error {
+			attempts++
+			inserted, err := db.InsertOrder(ctx, evt)
+			if err != nil {
+				return err
+			}
+			if inserted {
+				c.processed.Add(1)
+				log.Info("order persisted",
+					"partition", rec.Partition, "offset", rec.Offset,
+					"order_id", evt.OrderID, "event_id", evt.EventID,
+					"total_cents", evt.TotalCents, "attempts", attempts)
+			} else {
+				c.duplicates.Add(1)
+				log.Info("duplicate event ignored",
+					"partition", rec.Partition, "offset", rec.Offset,
+					"order_id", evt.OrderID, "event_id", evt.EventID)
+			}
+			return nil
+		})
+
+	if err == nil {
+		return true
+	}
+	if ctx.Err() != nil {
+		return false // shutting down; leave the offset uncommitted for redelivery
+	}
+
+	// Two different failures, two different stories to tell whoever reads the DLQ.
+	// "This record is broken" and "the database was down longer than we were
+	// willing to wait" call for completely different responses, and a dead-letter
+	// queue that cannot distinguish them is much less useful.
+	reason := broker.ReasonRetriesExhausted
+	if !store.IsRetryable(err) {
+		reason = broker.ReasonPoison
+	}
+	return deadLetter(ctx, dlq, log, rec, reason, err, attempts, c)
+}
+
+// deadLetter parks a record and lets the partition continue. If the DLQ write
+// itself fails, the record is neither persisted nor parked, so the offset must
+// not advance: the caller pauses the partition instead.
+func deadLetter(ctx context.Context, dlq *broker.DLQ, log *slog.Logger, rec *kgo.Record,
+	reason broker.Reason, cause error, attempts int, c *counters) bool {
+
+	if err := dlq.Send(ctx, rec, reason, cause, attempts); err != nil {
+		if ctx.Err() == nil {
+			log.Error("dead-letter failed, cannot make progress",
+				"partition", rec.Partition, "offset", rec.Offset, "err", err)
+		}
+		return false
+	}
+	c.dlq.Add(1)
+	return true
+}
+
+func heartbeat(ctx context.Context, log *slog.Logger, owned *broker.Assignment, c *counters) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			log.Info("heartbeat",
+				"owns", owned.String(),
+				"partition_count", owned.Count(),
+				"processed_total", c.processed.Load(),
+				"duplicates_total", c.duplicates.Load(),
+				"retries_total", c.retries.Load(),
+				"dlq_total", c.dlq.Load(),
+				"paused_partitions", c.paused.Load())
+		}
+	}
 }
 
 // watchdog bounds the shutdown. On the signal it starts a clock; if draining has
@@ -193,65 +313,6 @@ func watchdog(fetchCtx context.Context, log *slog.Logger, abandonWork context.Ca
 	}
 	abandonWork()
 	os.Exit(1)
-}
-
-// handle writes one record, returning false if the offset must not advance past it.
-func handle(ctx context.Context, db *store.Store, log *slog.Logger, rec *kgo.Record,
-	processed, duplicates *atomic.Int64) bool {
-
-	var evt order.Event
-	if err := json.Unmarshal(rec.Value, &evt); err != nil {
-		// A malformed record will never parse, however many times it is retried.
-		// Blocking the partition on it would be worse than skipping it; Day 6
-		// routes it to the dead-letter queue instead of merely logging.
-		log.Warn("undecodable record, skipping",
-			"partition", rec.Partition, "offset", rec.Offset, "err", err)
-		return true
-	}
-
-	inserted, err := db.InsertOrder(ctx, evt)
-	if err != nil {
-		if ctx.Err() != nil {
-			return false // shutting down, not a real failure
-		}
-		log.Error("write failed",
-			"partition", rec.Partition, "offset", rec.Offset,
-			"order_id", evt.OrderID, "err", err)
-		return false
-	}
-
-	if inserted {
-		processed.Add(1)
-		log.Info("order persisted",
-			"partition", rec.Partition, "offset", rec.Offset,
-			"order_id", evt.OrderID, "event_id", evt.EventID, "total_cents", evt.TotalCents)
-	} else {
-		duplicates.Add(1)
-		log.Info("duplicate event ignored",
-			"partition", rec.Partition, "offset", rec.Offset,
-			"order_id", evt.OrderID, "event_id", evt.EventID)
-	}
-	return true
-}
-
-func heartbeat(ctx context.Context, log *slog.Logger, owned *broker.Assignment,
-	processed, duplicates, paused *atomic.Int64) {
-
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			log.Info("heartbeat",
-				"owns", owned.String(),
-				"partition_count", owned.Count(),
-				"processed_total", processed.Load(),
-				"duplicates_total", duplicates.Load(),
-				"paused_partitions", paused.Load())
-		}
-	}
 }
 
 // workerID labels log lines so several workers on one machine stay tellable apart.

@@ -215,3 +215,67 @@ matrix gets run. And Day 12 wants one-command startup for a stranger cloning the
 
 The image is multi-stage onto `distroless/static` and runs as non-root: no shell and no
 package manager in the final image.
+
+## Retry classification: environment yes, data no
+
+`store.IsRetryable` maps PostgreSQL SQLSTATE classes to a single decision:
+
+| Class | Meaning | Retry? |
+|---|---|---|
+| 08 | connection exception | yes |
+| 53 | insufficient resources | yes |
+| 57 | operator intervention (shutdown) | yes |
+| 58 | system error | yes |
+| 40 | serialization failure, deadlock | yes |
+| 23 | integrity constraint violation | **no** |
+| 22 | data exception (bad UUID, bad number) | **no** |
+| 42 | syntax / access rule violation | **no** |
+
+The rule is: retry anything about the *environment*, never anything about the *data* or our own
+SQL. Getting this backwards is expensive in both directions — retrying a constraint violation
+burns the whole budget and then dead-letters a record that was never going to succeed, while
+not retrying a dropped connection dead-letters thousands of perfectly good orders because the
+database restarted.
+
+A stopped database mostly does *not* arrive as a `PgError` at all — it surfaces as a dial or
+DNS failure below the protocol — so anything unrecognised defaults to retryable.
+
+## Full jitter, not plain exponential backoff
+
+The delay is `rand(0, min(cap, base·2^n))`, not `min(cap, base·2^n)`.
+
+Jitter is the whole point rather than a refinement. Every worker that fails at the same
+instant — which is exactly what a database outage produces — would otherwise retry at the same
+instant, and the recovering database gets hit by the entire fleet in lockstep, at the precise
+moment it is least able to cope. Full jitter spreads them, and is what AWS's "Exponential
+Backoff and Jitter" measured as the best of the simple strategies.
+
+## The retry budget is elapsed time, not an attempt count
+
+`MaxElapsed: 45s` bounds the whole sequence; the attempt count falls out of it.
+
+An attempt count says nothing about how long the worker will be stuck, and "how long will this
+block" is the only question that matters to the consumer group: a worker inside a retry loop
+cannot respond to a rebalance. The budget is therefore set *below* franz-go's 60s rebalance
+timeout. Retrying past that point would trigger a rebalance storm on top of the outage that
+caused it — a self-inflicted second failure.
+
+## Two dead-letter reasons, not one
+
+`poison` means the record will never succeed: malformed JSON, a constraint violation, a value
+the schema rejects. `retries_exhausted` means it probably would have succeeded, but the
+environment stayed broken longer than the budget allowed.
+
+These call for completely different responses — fix the producer versus replay the batch — and
+a dead-letter queue that cannot tell them apart is much less useful than one that can.
+
+## The DLQ preserves the original bytes; the diagnosis rides in headers
+
+The dead-letter record carries the source key and value unchanged, with `dlq_reason`,
+`dlq_error`, `dlq_attempts`, `dlq_source_topic/partition/offset` and `dlq_failed_at` as Kafka
+headers.
+
+Wrapping the payload in an envelope would mean the dead-letter topic has a different shape
+from the source topic, so replaying it needs a special consumer that no one writes. That is how
+dead-letter queues quietly become write-only. Byte-identical records can be replayed by the
+same worker after the cause is fixed.

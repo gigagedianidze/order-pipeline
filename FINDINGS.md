@@ -223,3 +223,83 @@ removes a duplicate-processing race rather than relying on luck to miss it.**
 decision, the same as `docker stop`, so the restart policy does not fire. A process that dies
 on its own — panic, OOM — *is* restarted. Worth knowing before concluding from a chaos
 experiment that "the restart policy does not work".
+
+## Day 6 — Sun 13 Sep (started 7 Sep)
+
+### A 31-second database outage under load: nothing lost, nothing dead-lettered
+
+`docker compose stop postgres` mid-load, 31 seconds, then start again.
+
+| | |
+|---|---|
+| Accepted (202) | 4000 |
+| Rows in `orders` | **4000** |
+| Distinct `event_id` | **4000** |
+| Dead-lettered | **0** |
+| Duplicates | 0 |
+
+One record's complete trace through the outage:
+
+```
+17:34:57.977  write failed, retrying   attempt 1   FATAL: terminating connection due to
+                                                   administrator command (SQLSTATE 57P01)
+17:35:06.033  write failed, retrying   attempt 2   hostname resolving error: lookup postgres
+17:35:14.152  write failed, retrying   attempt 3   dial tcp 172.18.0.2:5432: connection refused
+17:35:22.181  write failed, retrying   attempt 4
+17:35:29.072  write failed, retrying   attempt 5
+17:35:29.895  order persisted          attempt 6
+```
+
+Postgres came back at 17:35:29; the record was written 0.8 seconds later. The first failure is
+`57P01` — the server saying goodbye on its way down — and subsequent ones degrade to DNS and
+then TCP failures as the container disappears. Three different error shapes for one event, all
+correctly classified as transient.
+
+### The retry budget is spent on connect timeouts, not on backoff
+
+Look at the gaps: roughly **8 seconds** between attempts. The backoff delays were 53ms, 116ms,
+25ms — microscopic by comparison. Almost the entire interval is the *connection attempt itself*
+timing out.
+
+This matters for tuning and would have been invisible without the trace. The 45s elapsed budget
+does not buy ~20 attempts as the backoff maths would suggest; it buys about **6**. A 31s outage
+survived with two attempts to spare. A 45-second outage would have exhausted the budget and
+dead-lettered live orders — not because anything was wrong with them, but because the budget is
+measured in wall-clock time that connect timeouts dominate.
+
+Two levers if that margin is too thin: raise `MaxElapsed` (bounded above by the 60s rebalance
+timeout — so this cannot go far), or shorten pgx's connect timeout so each attempt fails faster
+and more attempts fit in the same budget. The second is the better lever, and it is not obvious
+until you look at the timestamps.
+
+### Only 7 retry log lines for a 31-second outage
+
+Not a bug — a consequence of the shape of the retry loop. Each worker blocks on the *one*
+record it is retrying, so nothing else is attempted while the database is down. The backlog
+accumulates in Kafka as consumer lag rather than as a retry storm.
+
+That is the desirable behaviour: an outage produces a queue, not a thundering herd, and the
+queue drains at full speed on recovery. It also means "retries_total" is a poor proxy for
+outage severity — consumer lag is the metric that tells that story, which is Day 8's job.
+
+### Poison messages: classified correctly, no wasted retries
+
+Two hand-crafted bad records were injected, and five valid orders behind them still persisted.
+
+| Injected | Classified | Attempts | Why |
+|---|---|---|---|
+| Truncated JSON | `poison` | **0** | never parsed, so the database was never touched |
+| Valid JSON, `order_id: "NOT-A-UUID"` | `poison` | **1** | tried once, `22P02` is not retryable |
+
+`attempts=0` and `attempts=1` are the whole point: neither record burned the 45-second retry
+budget on a failure that could never resolve. Both landed in `orders.dlq` with the original key
+and value byte-for-byte, and the diagnosis in headers:
+
+```
+dlq_reason:poison, dlq_error:unexpected end of JSON input, dlq_attempts:0,
+dlq_source_topic:orders, dlq_source_partition:2, dlq_source_offset:0, dlq_failed_at:...
+```
+
+The partition never stalled and no crash loop occurred — the Day 4 behaviour where a bad record
+paused its partition indefinitely is now reserved for the one case that truly cannot make
+progress: Kafka itself being unreachable, so the record can be neither persisted nor parked.

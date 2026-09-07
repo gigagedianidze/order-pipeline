@@ -62,5 +62,19 @@ func (p *Producer) Publish(ctx context.Context, key string, value any) (partitio
 	return r.Partition, r.Offset, nil
 }
 
+// PublishRecord sends an already-built record, letting the caller set headers
+// and reuse the original key and value bytes unchanged.
+func (p *Producer) PublishRecord(ctx context.Context, rec *kgo.Record) (partition int32, offset int64, err error) {
+	if rec.Topic == "" {
+		rec.Topic = p.topic
+	}
+	res := p.client.ProduceSync(ctx, rec)
+	if err := res.FirstErr(); err != nil {
+		return 0, 0, fmt.Errorf("produce: %w", err)
+	}
+	r := res[0].Record
+	return r.Partition, r.Offset, nil
+}
+
 // Close flushes buffered records and shuts the client down.
 func (p *Producer) Close() { p.client.Close() }
