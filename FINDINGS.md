@@ -15,3 +15,20 @@ One line per surprise, written the day it happened. Undocumented experiments are
   list** so it survives as one argv entry.
 - Kafka warns that topic names mixing `.` and `_` can collide in metric names. `orders.dlq`
   is fine on its own; just don't also introduce `orders_dlq`.
+
+## Day 2 — Wed 9 Sep (started 7 Sep)
+
+- **Key stickiness verified directly**, not assumed: three records produced with the identical
+  key all landed on partition 2, while three different keys spread across 0, 1 and 2. Worth
+  doing once by hand — it turns "Kafka hashes the key" from a memorised sentence into an
+  observed fact.
+- franz-go's default partitioner is murmur2-compatible with the Java client, so records
+  produced by the Go API and by `kafka-console-producer.sh` with the same key agree on the
+  partition. Handy: CLI tools can be used to inject test traffic that lands where the real
+  producer would put it.
+- **Deleting and recreating a topic under a running producer did not break it.** franz-go
+  refreshed its metadata and kept producing; offsets restarted at 0 on the fresh topic. Useful
+  to know before Day 11, when topics get recreated with different partition counts.
+- Piping a string into `kafka-console-producer.sh` from PowerShell prepends a UTF-8 BOM to the
+  first record's key, silently making it a *different* key. When hand-injecting test records,
+  check the first one.
