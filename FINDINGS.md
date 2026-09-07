@@ -582,3 +582,156 @@ Single Kafka broker, single PostgreSQL instance, all of it plus the load generat
 Windows laptop under Docker Desktop. These figures characterise *this* deployment; they are not
 a statement about Kafka's or Go's capabilities. What survives the caveats is the *shape* — where
 the knee is, which direction each change moved things, and why.
+
+## Day 11 — Fri 18 Sep (started 7 Sep)
+
+### The ramp: nothing broke, up to 20× the sustainable write rate
+
+"Broken" was defined before the experiment (see DECISIONS.md): the API rejecting orders,
+accepted orders never reaching the database, or accept latency degrading non-linearly. A
+growing backlog explicitly does not count.
+
+4 workers, 3 partitions, 15s at each rate.
+
+| Offered | Achieved | 503s | Failed | Accept p99 | End-to-end p99 | Persisted | Missing | Peak lag |
+|---------|----------|------|--------|-----------|----------------|-----------|---------|----------|
+| 1,000   | 1000     | 0    | 0      | 1 ms      | 1 ms           | 15001     | **0**   | 2        |
+| 2,500   | 2500     | 0    | 0      | 2 ms      | 9 ms           | 37501     | **0**   | 11       |
+| 5,000   | 5000     | 0    | 0      | 3 ms      | 5352 ms        | 75001     | **0**   | 26908    |
+| 10,000  | 9999     | 0    | 0      | 4 ms      | 27316 ms       | 150001    | **0**   | 103533   |
+| 20,000  | 19998    | 0    | 0      | **15 ms** | **70971 ms**   | 300001    | **0**   | 261292   |
+
+At 20,000/s — more than five times what the write path can sustain — the API accepted every one
+of 300001 orders, rejected none, and every order reached the database. Accept latency went from
+1ms to 15ms while *offered load went up twentyfold*.
+
+The entire overload was converted into **71 seconds of lag**. That is the queue doing precisely
+the job it was introduced for, and it is why the definition of "broken" had to exclude a growing
+backlog: on any other definition this table reads as a catastrophic failure, when it is in fact
+the design working.
+
+The honest conclusion is therefore: **the ingress path has no breaking point within the load
+this host can generate.** The write path saturates around 3800 ev/s and everything above that
+becomes latency, not errors. Finding a real failure meant attacking the components that can
+actually fail, rather than pushing the rate higher.
+
+Caveat: `scheduler_behind` reached 250388 of 300001 at 20,000/s. The aggregate rate held
+(19998/s achieved), but per-request timing at that rate is limited by the generator, so the 15ms
+accept p99 should be read as approximate.
+
+### Three measurement bugs in one day, all producing plausible numbers
+
+Worth recording as its own finding, because it is the actual lesson of a benchmarking day.
+
+1. **A six-minute lookback window.** `max_over_time(expr[6m:5s])` looks back from *now*, and each
+   configuration took about ninety seconds, so runs reported the peak of previous runs. Tell:
+   three identical throughput figures and four identical peak lags.
+2. **A `rate()` window spanning the load boundary.** `rate(...[15s])` smoothed across the
+   boundary between the 10s load phase and the idle period before it, flattening the burst being
+   measured. It reported throughput as flat across all worker counts while peak lag showed 4
+   workers holding the backlog to a third of what 1 worker allowed — two claims that cannot both
+   be true.
+3. **Two load generators running at once.** An aborted run survived being cancelled and kept
+   generating load for forty minutes alongside its replacement, both appending to the same file.
+
+Every one of these produced numbers that looked reasonable. The first two were caught only by
+noticing internal contradictions; the third was caught by an impossible value — `persisted:
+-749`, a negative row count.
+
+The lesson is not "be careful". It is that a benchmark needs **cross-checks that can disagree
+with each other**: throughput derived independently of latency, lag measured by something other
+than the consumer, and a rate the generator reports separately from what the system observed.
+Any single number, taken alone, would have been believed.
+
+### Breaking the write path: a 90-second database outage
+
+The ramp could not break the system, so the next question was the boundary of something that
+was actually designed to fail: the 45-second retry budget from Day 6. A 31-second outage
+survived intact. This one is 90 seconds — deliberately double the budget — under 1000/s.
+
+| | |
+|---|---|
+| Accepted (202) | 150001 |
+| Persisted | 149995 |
+| **Dead-lettered** | **6**, all `reason=retries_exhausted` |
+| Lost | **0** |
+| Accept latency p99 | **1.4 ms** |
+| End-to-end p50 / p99 | 37s / 91s |
+
+149995 + 6 = 150001. **The system broke exactly where it was designed to, by exactly as much as
+it was designed to, and said so.**
+
+Three things make this the answer to "what broke first and why":
+
+**It is bounded.** Six records out of 150001 — 0.004%. Not "the outage caused data loss", but
+"six specific records exceeded a 45-second budget". Only the handful actually in flight per
+worker when the database vanished can exceed it; everything behind them waits in Kafka, costing
+latency rather than delivery.
+
+**It is attributed.** Each carries `reason=retries_exhausted`, distinguishing it from `poison`.
+An operator sees immediately that these are good records that ran out of time, not bad records
+that will never work — which is the difference between replaying them and fixing a producer.
+
+**It is recoverable.** The dead-letter records keep their original key and value byte-for-byte,
+so replaying them once the database is healthy needs no special tooling.
+
+Meanwhile accept latency was 1.4ms at p99. **The API never noticed the database was gone**, which
+is the entire argument for the asynchronous write path, demonstrated by taking the database away
+rather than by asserting it.
+
+The tuning conclusion from Day 6 stands and now has a boundary: the budget buys roughly six
+attempts because connect timeouts dominate it, and an outage longer than the budget dead-letters
+whatever is in flight. Raising it is capped by the 60s rebalance timeout, so the real lever is
+shortening the connect timeout so more attempts fit.
+
+### Breaking ingress: a 45-second broker outage
+
+The broker is the one component the architecture cannot absorb the loss of. The API produces
+synchronously and answers 202 only on an acknowledgement, so with no broker there is nothing
+honest to say. 500/s offered, Kafka stopped for 45 seconds.
+
+| | |
+|---|---|
+| Offered | 60001 |
+| Accepted (202) | 59617 |
+| **Rejected (503)** | **256** |
+| **Client transport failures** | **128** |
+| Persisted | 59617 — **missing 0** |
+| Accept latency p50 / p99 / max | 1.2 ms / **46.7 s** / 47.8 s |
+
+59617 + 256 + 128 = 60001. Every order is accounted for.
+
+**This is the first genuine availability failure in the project, and it is the right one.** Only
+384 orders out of 60001 were refused — but they were refused *honestly*. Not one false 202 was
+issued: the system never told a client an order was safe when it was not. That is the Day 2
+decision (`ProduceSync` with all-ISR acks on the request path) being paid for and collecting.
+
+The surprise is how few were refused. A 45-second outage at 500/s means roughly 22500 requests
+arrived while the broker was down, yet only 384 failed. franz-go buffers and retries internally
+up to `RecordDeliveryTimeout` (10s), so the great majority of those requests simply *waited* and
+succeeded once the broker returned.
+
+That is a trade-off, not a free win, and the accept-latency column is where it shows: **p99 of
+46.7 seconds**. The API did not fail fast, it held requests open. With a 128-deep in-flight limit
+in the generator, queueing pushed the worst case to 47.8s. A real client with a 30-second timeout
+would have given up and retried, turning one slow request into two.
+
+So the honest characterisation is: **a broker outage degrades availability, not correctness.**
+Whether "hold the request for 10 seconds" or "fail immediately" is right depends on the caller,
+and `RecordDeliveryTimeout` is the single knob that decides it. Ten seconds is defensible for a
+mobile client that would rather wait than resubmit; it is wrong for a synchronous checkout page.
+
+### Summary: what breaks, in order
+
+| Component lost | Result | Correctness | Availability |
+|---|---|---|---|
+| Worker (graceful) | rebalance in 1.35s | intact | intact |
+| Worker (killed) | rebalance in 43.2s, lag spike | intact | intact |
+| Database, < retry budget | latency only | intact | intact |
+| Database, > retry budget | 6 dead letters per 150001, tagged | intact | intact |
+| **Broker** | **384 refusals per 60001, 47s worst-case latency** | **intact** | **degraded** |
+
+Correctness survived every experiment run in this project. Nothing was ever lost, duplicated in
+the database, or silently dropped. The only thing any failure ever cost was time — except the
+broker, which costs availability, because it is the one component that has no queue in front of
+it.

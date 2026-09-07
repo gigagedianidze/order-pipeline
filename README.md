@@ -153,6 +153,24 @@ expectation. Partition count caps how many consumers can participate, but it onl
 nothing else saturates first — and here something else did. The full argument, and what the
 evidence says the real ceiling is, is in [FINDINGS.md](FINDINGS.md).
 
+## What breaks, and when
+
+Every failure mode was induced deliberately and measured. Full numbers in
+[FINDINGS.md](FINDINGS.md); the scripts are `scripts/ramp.sh`, `scripts/chaos-db-outage.sh` and
+`scripts/chaos-kafka.sh`.
+
+| Component lost | Result | Correctness | Availability |
+|---|---|---|---|
+| Worker (graceful stop) | rebalance in 1.35s | intact | intact |
+| Worker (killed) | rebalance in 43.2s, lag spike | intact | intact |
+| Database, outage < retry budget | latency only | intact | intact |
+| Database, outage > retry budget | 6 dead letters per 150001, tagged `retries_exhausted` | intact | intact |
+| **Broker** | **384 refusals per 60001, 47s worst-case latency** | **intact** | **degraded** |
+
+Overload is not a failure mode here. At 20,000/s — over 5× what the write path sustains — the
+API accepted all 300001 orders and lost none; the excess became 71 seconds of lag. The broker is
+the only hard dependency, because it is the one component with no queue in front of it.
+
 ## Metrics
 
 Every service exposes `/metrics` on port 2112. Prometheus discovers them through the Docker
@@ -227,3 +245,5 @@ Following the 13-day plan in [PLAN.md](PLAN.md).
   exactly, and reports when the generator itself is the bottleneck
 - **Day 10** — scaling matrix over 1/2/4/8 workers at 3 and 12 partitions; throughput rose
   1828 → 3807 ev/s, and raising the partition count made it *worse*, not better
+- **Day 11** — chaos and breaking point: nothing broke at 20,000/s; the only availability
+  failure in the project is losing the broker

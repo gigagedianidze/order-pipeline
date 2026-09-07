@@ -1,0 +1,25 @@
+sending 1000/s for 2m30s (tag=chaos-db, max in flight=128)
+
+=== chaos-db ===
+target rate        1000.0/s
+achieved rate      1000.0/s   (100.0% of target)
+wall clock          150.0s
+sent / accepted    150001 / 150001
+status codes     map[202:150001]
+
+accept latency (client -> 202, measured from scheduled send time)
+  count            150001
+  p50                 0.8 ms
+  p95                 1.1 ms
+  p99                 1.4 ms
+  max                14.0 ms
+
+end-to-end latency (api accepted -> row committed)
+  count            149995
+  p50             37071.6 ms
+  p95             86297.1 ms
+  p99             91317.9 ms
+  max             94452.3 ms
+  MISSING               6 rows accepted but not persisted within the drain window
+
+report written to reports/chaos-db.json

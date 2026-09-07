@@ -1,0 +1,32 @@
+{
+  "tag": "chaos-kafka",
+  "target_rate": 500,
+  "achieved_rate": 496.8052895729259,
+  "duration": "2m0s",
+  "wall_clock_seconds": 120.0007352,
+  "concurrency": 128,
+  "sent": 60001,
+  "accepted": 59617,
+  "failed": 128,
+  "scheduler_behind": 24660,
+  "accept_latency": {
+    "count": 59873,
+    "missing": 0,
+    "p50_seconds": 0.0011595,
+    "p95_seconds": 42.1158783,
+    "p99_seconds": 46.7119793,
+    "max_seconds": 47.832166
+  },
+  "end_to_end_latency": {
+    "count": 59617,
+    "missing": 0,
+    "p50_seconds": 0.000681,
+    "p95_seconds": 6.637192199999999,
+    "p99_seconds": 7.138587599999999,
+    "max_seconds": 7.345744
+  },
+  "status_codes": {
+    "202": 59617,
+    "503": 256
+  }
+}

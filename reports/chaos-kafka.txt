@@ -1,0 +1,26 @@
+sending 500/s for 2m0s (tag=chaos-kafka, max in flight=128)
+
+=== chaos-kafka ===
+target rate         500.0/s
+achieved rate       496.8/s   (99.4% of target)
+wall clock          120.0s
+sent / accepted     60001 / 59617
+failed                128
+scheduler behind    24660   (generator could not keep up; treat results with suspicion)
+status codes     map[202:59617 503:256]
+
+accept latency (client -> 202, measured from scheduled send time)
+  count             59873
+  p50                 1.2 ms
+  p95             42115.9 ms
+  p99             46712.0 ms
+  max             47832.2 ms
+
+end-to-end latency (api accepted -> row committed)
+  count             59617
+  p50                 0.7 ms
+  p95              6637.2 ms
+  p99              7138.6 ms
+  max              7345.7 ms
+
+report written to reports/chaos-kafka.json

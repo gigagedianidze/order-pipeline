@@ -42,6 +42,15 @@ reset_topic() {
   k kafka-topics.sh --bootstrap-server kafka:19092 --create --topic orders \
      --partitions "$PARTITIONS" --replication-factor 1 >/dev/null 2>&1
   psql_ "truncate table orders;" >/dev/null
+
+  # The API's producer caches topic metadata. Adding partitions is fine, but
+  # *removing* them (recreating a 12-partition topic with 3) leaves the client
+  # holding partitions that no longer exist, and every produce then fails with
+  # "metadata update is missing a partition that we were previously using" —
+  # observed as 75% of requests returning 503. Restarting the producer is the
+  # only way out, so the experiment protocol does it every time.
+  docker compose restart api >/dev/null 2>&1
+  sleep 5
 }
 
 printf 'partitions\tworkers\tthroughput_evs\tp50_ms\tp95_ms\tp99_ms\tmax_ms\tpeak_lag\tpersisted\n' | tee "$OUT"

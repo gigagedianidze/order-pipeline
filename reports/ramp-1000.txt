@@ -1,0 +1,24 @@
+sending 1000/s for 15s (tag=ramp-1000, max in flight=128)
+
+=== ramp-1000 ===
+target rate        1000.0/s
+achieved rate      1000.0/s   (100.0% of target)
+wall clock           15.0s
+sent / accepted     15001 / 15001
+status codes     map[202:15001]
+
+accept latency (client -> 202, measured from scheduled send time)
+  count             15001
+  p50                 0.8 ms
+  p95                 1.1 ms
+  p99                 1.4 ms
+  max                13.1 ms
+
+end-to-end latency (api accepted -> row committed)
+  count             15001
+  p50                 0.4 ms
+  p95                 0.6 ms
+  p99                 1.2 ms
+  max                14.8 ms
+
+report written to reports/ramp-1000.json

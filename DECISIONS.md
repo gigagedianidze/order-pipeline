@@ -486,3 +486,17 @@ and the numbers drift in a direction that flatters whichever run happened to be 
 Workers are scaled to zero before the topic is touched — deleting a topic under a live consumer
 group produces a burst of errors that has nothing to do with the experiment — and the script
 then waits 20 seconds for the group to settle, so no run measures a rebalance.
+
+## "Broken" is defined before the experiment, not after
+
+Without a definition fixed in advance, any result can be narrated as breaking or not breaking
+once it is on the screen. For the ramp, the system is broken when:
+
+- the API rejects orders (503) or the client sees connection failures;
+- accepted orders fail to reach the database within the drain window;
+- accept latency degrades non-linearly rather than proportionally.
+
+**A growing backlog is explicitly not breaking.** It is the queue doing precisely what it was
+introduced to do, and telling those two apart is most of what this system exists to demonstrate.
+A design that absorbs a 5× overload as 18 seconds of lag and zero losses has not failed; one
+that returns 503 at the same load has.

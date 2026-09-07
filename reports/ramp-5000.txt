@@ -1,0 +1,25 @@
+sending 5000/s for 15s (tag=ramp-5000, max in flight=128)
+
+=== ramp-5000 ===
+target rate        5000.0/s
+achieved rate      4999.8/s   (100.0% of target)
+wall clock           15.0s
+sent / accepted     75001 / 75001
+scheduler behind    23793   (generator could not keep up; treat results with suspicion)
+status codes     map[202:75001]
+
+accept latency (client -> 202, measured from scheduled send time)
+  count             75001
+  p50                 0.9 ms
+  p95                 1.9 ms
+  p99                 3.1 ms
+  max                49.9 ms
+
+end-to-end latency (api accepted -> row committed)
+  count             75001
+  p50              3847.7 ms
+  p95              5266.8 ms
+  p99              5351.8 ms
+  max              5399.2 ms
+
+report written to reports/ramp-5000.json

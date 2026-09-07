@@ -1,0 +1,31 @@
+{
+  "tag": "ramp-2500",
+  "target_rate": 2500,
+  "achieved_rate": 2500.0501996693515,
+  "duration": "15s",
+  "wall_clock_seconds": 15.0000988,
+  "concurrency": 128,
+  "sent": 37501,
+  "accepted": 37501,
+  "failed": 0,
+  "scheduler_behind": 1290,
+  "accept_latency": {
+    "count": 37501,
+    "missing": 0,
+    "p50_seconds": 0.0008139,
+    "p95_seconds": 0.0013674,
+    "p99_seconds": 0.0019592,
+    "max_seconds": 0.0148501
+  },
+  "end_to_end_latency": {
+    "count": 37501,
+    "missing": 0,
+    "p50_seconds": 0.001533,
+    "p95_seconds": 0.004956,
+    "p99_seconds": 0.009104,
+    "max_seconds": 0.020111
+  },
+  "status_codes": {
+    "202": 37501
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "tag": "chaos-db",
+  "target_rate": 1000,
+  "achieved_rate": 1000.0022999899568,
+  "duration": "2m30s",
+  "wall_clock_seconds": 150.000655,
+  "concurrency": 128,
+  "sent": 150001,
+  "accepted": 150001,
+  "failed": 0,
+  "scheduler_behind": 0,
+  "accept_latency": {
+    "count": 150001,
+    "missing": 0,
+    "p50_seconds": 0.0008047,
+    "p95_seconds": 0.0010992,
+    "p99_seconds": 0.0014243,
+    "max_seconds": 0.0139578
+  },
+  "end_to_end_latency": {
+    "count": 149995,
+    "missing": 6,
+    "p50_seconds": 37.071594,
+    "p95_seconds": 86.29706409999999,
+    "p99_seconds": 91.31786138000001,
+    "max_seconds": 94.452261
+  },
+  "status_codes": {
+    "202": 150001
+  }
+}
