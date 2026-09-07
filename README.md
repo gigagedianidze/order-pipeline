@@ -130,6 +130,29 @@ end-to-end latency (api accepted -> row committed)
 `scheduler behind` in the output means the generator could not dispatch on schedule — a
 statement about the harness, not the system. Check it before believing a high-rate result.
 
+## The scaling experiment
+
+```sh
+scripts/scaling-matrix.sh 3 1 2 4 8      # 3 partitions, 1/2/4/8 workers
+scripts/scaling-matrix.sh 12 4 8         # same again with the ceiling raised
+```
+
+Each configuration is deliberately overloaded and the drain is measured, because workers only
+run flat out while a backlog exists — offering a rate the system keeps up with would measure
+the load generator. Raw per-run reports are in `reports/`.
+
+| Workers | 3 partitions | 12 partitions |
+|---------|--------------|---------------|
+| 1       | 1828 ev/s    | 1922 ev/s     |
+| 2       | 2333 ev/s    | —             |
+| 4       | 3348 ev/s    | 1932 ev/s     |
+| 8       | 3807 ev/s    | 2410 ev/s     |
+
+Quadrupling the partitions made the system **slower**, which is the opposite of the textbook
+expectation. Partition count caps how many consumers can participate, but it only binds if
+nothing else saturates first — and here something else did. The full argument, and what the
+evidence says the real ceiling is, is in [FINDINGS.md](FINDINGS.md).
+
 ## Metrics
 
 Every service exposes `/metrics` on port 2112. Prometheus discovers them through the Docker
@@ -202,3 +225,5 @@ Following the 13-day plan in [PLAN.md](PLAN.md).
   counters and consumer lag from two independent sources
 - **Day 9** — load harness with a scheduled (not emergent) send rate; holds 100/s and 1000/s
   exactly, and reports when the generator itself is the bottleneck
+- **Day 10** — scaling matrix over 1/2/4/8 workers at 3 and 12 partitions; throughput rose
+  1828 → 3807 ev/s, and raising the partition count made it *worse*, not better

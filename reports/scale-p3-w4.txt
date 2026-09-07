@@ -1,0 +1,25 @@
+sending 5000/s for 10s (tag=scale-p3-w4, max in flight=128)
+
+=== scale-p3-w4 ===
+target rate        5000.0/s
+achieved rate      4999.8/s   (100.0% of target)
+wall clock           10.0s
+sent / accepted     50001 / 50001
+scheduler behind    15318   (generator could not keep up; treat results with suspicion)
+status codes     map[202:50001]
+
+accept latency (client -> 202, measured from scheduled send time)
+  count             50001
+  p50                 0.9 ms
+  p95                 1.9 ms
+  p99                 3.0 ms
+  max                39.8 ms
+
+end-to-end latency (api accepted -> row committed)
+  count             50001
+  p50              2697.5 ms
+  p95              4243.8 ms
+  p99              4337.8 ms
+  max              4359.2 ms
+
+report written to reports/scale-p3-w4.json

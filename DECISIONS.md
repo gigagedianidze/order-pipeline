@@ -463,3 +463,26 @@ Percentiles taken while a backlog is still draining describe only the orders tha
 be fast already. The harness polls until the persisted count reaches the accepted count (or the
 drain deadline expires) and reports any shortfall as `MISSING`, so an incomplete measurement is
 labelled rather than quietly optimistic.
+
+## Throughput is measured while a backlog exists
+
+The scaling runs deliberately overload the pipeline — 5000/s offered into a system that cannot
+persist at that rate — and measure how fast it drains.
+
+That is the only condition under which the workers run flat out, so the persisted rate equals
+*capacity*. Offering a rate the system comfortably keeps up with measures the load generator
+instead: every configuration would report the offered rate and the table would show a flat line
+regardless of how many workers were running.
+
+Capacity is read as `max_over_time(sum(rate(orders_processed_total{status="persisted"}[30s])))`
+over the run, and peak backlog as the same over `kafka_consumergroup_lag`.
+
+## Each configuration starts from a clean topic
+
+Every run deletes and recreates the topic and truncates the table. Otherwise the second
+configuration begins with the first one's committed offsets and a partially warm page cache,
+and the numbers drift in a direction that flatters whichever run happened to be later.
+
+Workers are scaled to zero before the topic is touched — deleting a topic under a live consumer
+group produces a burst of errors that has nothing to do with the experiment — and the script
+then waits 20 seconds for the group to settle, so no run measures a rebalance.

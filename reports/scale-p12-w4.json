@@ -1,0 +1,31 @@
+{
+  "tag": "scale-p12-w4",
+  "target_rate": 5000,
+  "achieved_rate": 4999.938501986386,
+  "duration": "10s",
+  "wall_clock_seconds": 10.000323,
+  "concurrency": 128,
+  "sent": 50001,
+  "accepted": 50001,
+  "failed": 0,
+  "scheduler_behind": 15024,
+  "accept_latency": {
+    "count": 50001,
+    "missing": 0,
+    "p50_seconds": 0.0008324,
+    "p95_seconds": 0.0016023,
+    "p99_seconds": 0.0026386,
+    "max_seconds": 0.0580746
+  },
+  "end_to_end_latency": {
+    "count": 50001,
+    "missing": 0,
+    "p50_seconds": 9.249204,
+    "p95_seconds": 16.852139,
+    "p99_seconds": 17.042271,
+    "max_seconds": 17.069505
+  },
+  "status_codes": {
+    "202": 50001
+  }
+}

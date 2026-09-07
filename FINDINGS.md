@@ -497,3 +497,88 @@ individual ticks averages out. But sub-millisecond per-request timings at those 
 read as approximate, and any Day 11 result at high rates has to be checked against this counter
 before it is believed. A benchmark that cannot tell "the system is slow" from "my generator is
 slow" is not measuring anything.
+
+## Day 10 — Thu 17 Sep (started 7 Sep)
+
+### Method
+
+Each configuration is deliberately overloaded — 5000/s offered for 10s into a system that
+cannot persist at that rate — and the drain is measured. Throughput is therefore *capacity*,
+not the offered rate: workers only run flat out while a backlog exists.
+
+Every run starts from a deleted and recreated topic and a truncated table, with workers scaled
+to zero first and 20 seconds allowed for the group to settle, so no run measures a rebalance or
+inherits the previous run's offsets.
+
+### Results: 3 partitions
+
+| Workers | Throughput (ev/s) | p50 | p95 | p99 | Peak lag | Persisted |
+|---------|-------------------|------|------|------|----------|-----------|
+| 1       | 1828              | 8833 | 16770 | 16920 | 38879 | 50001 |
+| 2       | 2333              | 3901 | 12279 | 12709 | 29012 | 50001 |
+| 4       | 3348              | 2698 | 4244  | 4338  | 17830 | 50001 |
+| 8       | 3807              | 2764 | 4100  | 4218  | 19119 | 50001 |
+
+Latencies in ms, measured from `occurred_at` to `processed_at` on the rows themselves. Every
+configuration persisted all 50001 orders — the system never lost anything, it only took longer.
+
+### Results: 12 partitions — the ceiling did **not** move
+
+| Workers | Throughput (ev/s) | p50 | p95 | p99 | Peak lag | Persisted |
+|---------|-------------------|------|------|------|----------|-----------|
+| 1       | 1922              | 8445 | 14735 | 15535 | 30831 | 50001 |
+| 4       | 1932              | 9249 | 16852 | 17042 | 29401 | 50001 |
+| 8       | 2410              | 3962 | 11167 | 11940 | 26438 | 50001 |
+
+Side by side:
+
+| Workers | 3 partitions | 12 partitions | Change |
+|---------|--------------|---------------|--------|
+| 1       | 1828         | 1922          | +5% (noise) |
+| 4       | 3348         | **1932**      | **−42%** |
+| 8       | 3807         | **2410**      | **−37%** |
+
+**The prediction was wrong, and that is the finding.** The plan expected throughput to plateau
+at 3 workers because there are 3 partitions, and to rise once the topic had 12. Quadrupling the
+partition count instead made the system *slower* at every worker count above one.
+
+### Why: partition count was never the ceiling here
+
+Three pieces of evidence point the same way.
+
+**Per-worker throughput falls as workers are added.** One worker sustains 1828 ev/s. At 3
+partitions and 4 workers only three can consume, and they manage 3348 between them — about 1116
+each, well under half what a single worker achieves alone. Adding consumers is not unlocking
+parallelism; it is dividing a fixed resource and paying coordination costs on top.
+
+**The single-worker number barely moved with 4× the partitions** (1828 → 1922). If partitions
+were the constraint, the one-consumer case is the one that should have been unaffected — and it
+was. Everything else got worse.
+
+**More partitions fragment the work.** The same 50001 records spread over 12 partitions instead
+of 3 means each partition's batches are a quarter the size, so every poll returns less useful
+work per round trip while the worker maintains four times as much fetch state against a single
+broker. That is pure overhead when partitions are not the bottleneck.
+
+The likely real ceiling is the shared PostgreSQL instance, and the worker's own design: records
+are processed **one at a time, serially** — `EachPartition` walks partitions in turn and each
+record is a separate `INSERT` round trip. A single worker's throughput is therefore roughly
+1/(database round trip), and 1828 ev/s implies about 0.55ms per write, which matches the
+measured p50 write time almost exactly. Owning more partitions cannot help a worker that
+processes them sequentially.
+
+**The honest interview answer is therefore not "partition count is the parallelism ceiling"** —
+it is: *partition count is the ceiling on how many consumers can participate, but it is only the
+binding constraint if nothing else saturates first. Here something else did, so adding
+partitions bought nothing and cost batching efficiency.* Day 11 identifies what breaks first.
+
+Two obvious improvements this measurement suggests, neither of which is more partitions:
+batch the inserts (one multi-row `INSERT` per poll instead of one per record), and process
+partitions concurrently within a worker instead of serially.
+
+### Caveats worth stating before quoting any of these numbers
+
+Single Kafka broker, single PostgreSQL instance, all of it plus the load generator on one
+Windows laptop under Docker Desktop. These figures characterise *this* deployment; they are not
+a statement about Kafka's or Go's capabilities. What survives the caveats is the *shape* — where
+the knee is, which direction each change moved things, and why.
