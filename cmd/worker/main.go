@@ -16,9 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"orderpipeline/internal/broker"
-	"orderpipeline/internal/config"
-	"orderpipeline/internal/order"
+	"github.com/gigagedianidze/order-pipeline/internal/broker"
+	"github.com/gigagedianidze/order-pipeline/internal/config"
+	"github.com/gigagedianidze/order-pipeline/internal/order"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 )

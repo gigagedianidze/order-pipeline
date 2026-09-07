@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"orderpipeline/internal/config"
+	"github.com/gigagedianidze/order-pipeline/internal/config"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kadm"

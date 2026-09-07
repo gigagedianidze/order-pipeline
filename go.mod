@@ -1,4 +1,4 @@
-module orderpipeline
+module github.com/gigagedianidze/order-pipeline
 
 go 1.27
 

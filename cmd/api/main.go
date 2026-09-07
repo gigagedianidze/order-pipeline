@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	"orderpipeline/internal/broker"
-	"orderpipeline/internal/config"
-	"orderpipeline/internal/order"
+	"github.com/gigagedianidze/order-pipeline/internal/broker"
+	"github.com/gigagedianidze/order-pipeline/internal/config"
+	"github.com/gigagedianidze/order-pipeline/internal/order"
 )
 
 const maxBodyBytes = 1 << 20 // 1 MiB
