@@ -161,3 +161,65 @@ therefore means either waiting out the timeout or, faster, running the test unde
 40 orders posted to the API, 2 workers: 25 + 15 persisted, 0 errors, 40 rows. The split is
 uneven because partitions are assigned whole — 2 partitions vs 1 — not because work is
 distributed per message.
+
+## Day 5 — Sat 12 Sep (started 7 Sep)
+
+### Graceful shutdown mid-load: zero lost, zero duplicated
+
+4000 orders posted while two workers consumed; `docker stop` on worker-1 partway through.
+
+| | |
+|---|---|
+| Accepted (202) | 4000 |
+| Rows in `orders` | **4000** |
+| Distinct `event_id` | **4000** |
+| Duplicate events seen by workers | **0** |
+| Worker errors | 0 |
+| API 503s | 0 |
+
+Acceptance met, and verified by row count rather than by vibes. The worker drained and exited
+in **0.19s**, having processed 446 events with 0 duplicates.
+
+**Zero duplicates is the interesting half.** No message was lost — that was never really at
+risk, since uncommitted offsets are simply redelivered. What a clean drain buys is that no
+message is *reprocessed* either: every record the worker had in hand was written and its
+offset committed before the process left. Idempotency would have absorbed the duplicates
+silently, so this number only exists because the shutdown path is right.
+
+### Graceful vs. hard kill: 1.35s versus 43.2s
+
+| | `docker stop` (SIGTERM) | `docker kill` (SIGKILL) |
+|---|---|---|
+| Partitions reassigned after | **1.35s** | **43.2s** |
+| Mechanism | `LeaveGroup` sent on the way out | group waits out `session.timeout.ms` |
+| In-flight work | drained and committed | abandoned mid-batch |
+
+Killed at 17:24:51.93, reassigned at 17:25:35.12. During those 43 seconds the group still
+listed the *dead* worker as the owner of partitions 0 and 1, while the producer kept writing:
+lag on those partitions climbed past 300 and kept growing. Partition 2, owned by the surviving
+worker, stayed at lag 1 throughout.
+
+That is the concrete cost of an uncontrolled crash, and it is not "some downtime" — it is a
+specific number, produced by a specific setting, on partitions that are otherwise perfectly
+healthy.
+
+**The hard kill also lost nothing and duplicated nothing: 4000 accepted, 4000 rows, 4000
+distinct event ids, 0 duplicates.** That was not the expected result and it is worth stating
+plainly rather than reporting the tidier story.
+
+Loss was never at risk — an uncommitted offset is simply redelivered. Duplicates were not
+observed because the duplicate window is genuinely narrow: it opens only between a successful
+database write and the offset commit that follows it. Offsets are committed once per poll
+batch, so SIGKILL has to land inside that gap to cause reprocessing, and in this run it did
+not. A busier worker, larger batches, or a slower commit would widen the window.
+
+So the honest summary of graceful shutdown is not "it prevents data loss" — at-least-once plus
+an idempotent write already do that. It is: **it collapses recovery from 43s to 1.4s, and it
+removes a duplicate-processing race rather than relying on luck to miss it.**
+
+### `restart: unless-stopped` does not restart a `docker kill`ed container
+
+`RestartCount: 0` after SIGKILL. Docker treats an explicit `docker kill` as an operator
+decision, the same as `docker stop`, so the restart policy does not fire. A process that dies
+on its own — panic, OOM — *is* restarted. Worth knowing before concluding from a chaos
+experiment that "the restart policy does not work".

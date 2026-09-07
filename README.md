@@ -31,9 +31,23 @@ There is no UI. This is a backend system: you drive it with `curl`, `grpcurl` an
 
 ## Run it
 
+Everything, including the services, runs in Compose:
+
 ```sh
-docker compose up -d          # Kafka (KRaft) + Postgres + topic creation
+docker compose up -d --build --scale worker=2
+```
+
+That brings up Kafka (KRaft), PostgreSQL, creates the topics, and starts the API and two
+workers. To change the number of workers, re-run with a different `--scale worker=N`.
+
+For iterating on Go code it is often quicker to run a service on the host against the
+containerised infrastructure:
+
+```sh
+docker compose up -d kafka postgres kafka-init
 go run ./cmd/smoke            # acceptance check: talks to both, exits 0
+go run ./cmd/api
+WORKER_ID=w1 go run ./cmd/worker
 ```
 
 On Windows without GNU make, `scripts\dev.ps1 <target>` mirrors the Makefile:
@@ -99,3 +113,5 @@ Following the 13-day plan in [PLAN.md](PLAN.md).
 - **Day 4** — idempotent persistence: `UNIQUE (event_id)` + `ON CONFLICT DO NOTHING`, offsets
   committed only after a successful write, failed writes pause their partition rather than
   being committed past
+- **Day 5** — graceful shutdown: stop fetching, drain in-flight writes, commit, leave the
+  group, close the pool — with a 15s deadline and a hard-exit fallback; services containerised

@@ -68,6 +68,42 @@ services:
       timeout: 5s
       retries: 20
 
+  api:
+    build:
+      context: .
+      args:
+        SERVICE: api
+    container_name: edp-api
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: kafka:19092
+      API_ADDR: ":8080"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      args:
+        SERVICE: worker
+    # No container_name: it must stay scalable with `--scale worker=N`.
+    environment:
+      KAFKA_BROKERS: kafka:19092
+      POSTGRES_DSN: postgres://orders:orders@postgres:5432/orders?sslmode=disable
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    # Compose's default is 10s from SIGTERM to SIGKILL. The worker's own drain
+    # deadline is 15s, so the grace period must exceed it or a slow drain is
+    # killed by the orchestrator rather than finishing.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
 volumes:
   kafka-data:
   pg-data:

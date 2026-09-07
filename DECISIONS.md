@@ -157,3 +157,61 @@ ceremony.
 
 Deliberately modest. Day 11 wants pool exhaustion to be a reachable, observable failure mode
 rather than something hidden behind a default large enough to never bite locally.
+
+## Two contexts in the worker: one for fetching, one for work
+
+`signal.NotifyContext` gives a context cancelled on SIGTERM. Passing that context to the
+database calls is the obvious thing to do and it is wrong: on shutdown it aborts exactly the
+in-flight writes the drain exists to finish, so every clean stop produces redelivery.
+
+So `fetchCtx` is cancelled by the signal and stops the worker asking Kafka for more records,
+while `workCtx` is independent and lets records already in hand be written and committed.
+The signal means *stop taking on new work*, not *drop the work you have*.
+
+## Shutdown order
+
+1. **Stop fetching** — the signal cancels `fetchCtx`, so no new records are pulled.
+2. **Finish in-flight work and commit its offsets** — under `workCtx`, which the signal does
+   not cancel.
+3. **Leave the group** — `client.Close()` blocks until `LeaveGroup` is acknowledged, so the
+   remaining members rebalance immediately instead of waiting out the 45-second session
+   timeout.
+4. **Close the database pool.**
+
+Swapping 2 and 3 is the tempting mistake: leaving the group first hands the partitions to
+another member while this one still has uncommitted writes in flight, so the same records are
+processed twice. Idempotency would absorb it, but it is wasted work caused by an avoidable
+ordering bug.
+
+## A drain deadline with a hard exit, and a second signal that skips the wait
+
+A shutdown that hangs is worse than an abrupt one: the orchestrator kills it anyway, just
+later and less predictably. The worker gives itself 15 seconds, then logs and exits non-zero.
+A second SIGTERM/SIGINT exits immediately — an operator sending it twice has already decided
+not to wait.
+
+`stop_grace_period: 30s` in Compose is set *above* the worker's own 15s deadline. If the
+platform's grace period were the shorter of the two, the drain would be cut off by SIGKILL and
+the deadline would never be the thing that decides. This pair has to be chosen together;
+Kubernetes has exactly the same relationship with `terminationGracePeriodSeconds`.
+
+## What graceful shutdown actually buys
+
+Not "no data loss" — at-least-once delivery plus an idempotent write already guarantee that,
+and it was confirmed by a SIGKILL run that also finished with 4000 accepted and 4000 rows.
+
+What it buys, measured: recovery in **1.4s instead of 43s**, because `LeaveGroup` triggers an
+immediate rebalance rather than the group waiting out `session.timeout.ms` with the dead
+member's partitions stranded and their lag climbing. And it removes a duplicate-processing
+race — the window between a successful write and its offset commit — instead of relying on a
+crash to miss it.
+
+## Services run in containers now
+
+Not scope creep for its own sake — three things need it. `docker stop` is the only realistic
+way to deliver a genuine SIGTERM (Windows has no such signal, so the shutdown path could not
+otherwise be tested at all). `docker compose up --scale worker=N` is how Day 10's scaling
+matrix gets run. And Day 12 wants one-command startup for a stranger cloning the repo.
+
+The image is multi-stage onto `distroless/static` and runs as non-root: no shell and no
+package manager in the final image.

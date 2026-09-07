@@ -25,21 +25,33 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
+// shutdownDeadline bounds draining. Compose gives a container 10s by default
+// before SIGKILL, so the service's own deadline must be set against whatever
+// grace period the orchestrator allows (this stack sets 30s).
+const shutdownDeadline = 15 * time.Second
+
 func main() {
 	cfg := config.Load()
 	log := cfg.Logger("worker").With("worker_id", workerID())
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// Two contexts, deliberately.
+	//
+	// fetchCtx is cancelled the moment a signal arrives: it stops the worker
+	// asking Kafka for more records. workCtx is NOT cancelled by the signal, so
+	// records already in hand can still be written and committed — cancelling the
+	// database context on SIGTERM would abort in-flight writes and guarantee the
+	// redelivery that a clean shutdown exists to avoid.
+	fetchCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	workCtx, abandonWork := context.WithCancel(context.Background())
+	defer abandonWork()
 
-	db, err := store.New(ctx, cfg.PostgresDSN)
+	db, err := store.New(workCtx, cfg.PostgresDSN)
 	if err != nil {
 		log.Error("connect postgres", "err", err)
 		os.Exit(1)
 	}
-	defer db.Close()
-
-	if err := db.Migrate(ctx); err != nil {
+	if err := db.Migrate(workCtx); err != nil {
 		log.Error("migrate", "err", err)
 		os.Exit(1)
 	}
@@ -55,16 +67,24 @@ func main() {
 		log.Error("start consumer", "err", err)
 		os.Exit(1)
 	}
-	defer client.Close()
-
 	log.Info("joining group", "group", cfg.KafkaGroupID, "topic", cfg.KafkaTopic)
 
 	var processed, duplicates, paused atomic.Int64
-	go heartbeat(ctx, log, owned, &processed, &duplicates, &paused)
+	go heartbeat(fetchCtx, log, owned, &processed, &duplicates, &paused)
+
+	// A shutdown that hangs is worse than one that is abrupt: the container is
+	// killed anyway, but later and less predictably. Once the signal arrives the
+	// worker has shutdownDeadline to finish, then exits hard.
+	go watchdog(fetchCtx, log, abandonWork)
 
 	for {
-		fetches := client.PollFetches(ctx)
-		if fetches.IsClientClosed() || ctx.Err() != nil {
+		fetches := client.PollFetches(fetchCtx)
+		if fetches.IsClientClosed() {
+			break
+		}
+		// A signal with nothing in hand means there is no in-flight work to
+		// finish. With records in hand, fall through and process them first.
+		if fetchCtx.Err() != nil && fetches.NumRecords() == 0 {
 			break
 		}
 		fetches.EachError(func(topic string, partition int32, err error) {
@@ -81,10 +101,10 @@ func main() {
 
 		fetches.EachPartition(func(p kgo.FetchTopicPartition) {
 			for _, rec := range p.Records {
-				if ctx.Err() != nil {
-					return
+				if workCtx.Err() != nil {
+					return // deadline exceeded; the watchdog is about to exit
 				}
-				ok := handle(ctx, db, log, rec, &processed, &duplicates)
+				ok := handle(workCtx, db, log, rec, &processed, &duplicates)
 				if !ok {
 					// Stop at the first failure in this partition AND pause it.
 					//
@@ -119,19 +139,60 @@ func main() {
 		}
 
 		if len(committable) == 0 {
+			if fetchCtx.Err() != nil {
+				break
+			}
 			continue
 		}
 		// Commit last, and only for records that are already in the database.
 		// Committing before the write is what loses messages on a crash.
-		if err := client.CommitRecords(ctx, committable...); err != nil && ctx.Err() == nil {
+		if err := client.CommitRecords(workCtx, committable...); err != nil && workCtx.Err() == nil {
 			// The records are written but the offsets are not advanced, so they
 			// will be redelivered. Idempotency makes that harmless.
 			log.Error("commit offsets", "err", err)
 		}
 	}
 
-	log.Info("shutdown signal received, leaving group",
+	// Shutdown order matters and is the point of the day:
+	//   1. stop fetching        (fetchCtx cancelled by the signal, above)
+	//   2. finish in-flight work and commit its offsets (the loop above)
+	//   3. leave the group      — Close() sends LeaveGroup, so the remaining
+	//                             members rebalance immediately instead of
+	//                             waiting out the 45s session timeout
+	//   4. close the database pool
+	//
+	// Reversing 2 and 3 would hand the partitions to another member while this
+	// one still had uncommitted writes in progress: duplicate work at best.
+	log.Info("draining complete, leaving group",
+		"processed_total", processed.Load(),
+		"duplicates_total", duplicates.Load())
+
+	client.Close() // blocks until LeaveGroup is acknowledged
+	db.Close()
+
+	log.Info("stopped cleanly",
 		"processed_total", processed.Load(), "duplicates_total", duplicates.Load())
+}
+
+// watchdog bounds the shutdown. On the signal it starts a clock; if draining has
+// not finished by shutdownDeadline it cancels in-flight work and exits hard, so
+// the process never outlives the orchestrator's own grace period silently.
+func watchdog(fetchCtx context.Context, log *slog.Logger, abandonWork context.CancelFunc) {
+	<-fetchCtx.Done()
+	log.Info("shutdown signal received, draining", "deadline", shutdownDeadline)
+
+	// A second signal means the operator is not willing to wait.
+	impatient := make(chan os.Signal, 1)
+	signal.Notify(impatient, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case <-time.After(shutdownDeadline):
+		log.Error("shutdown deadline exceeded, exiting hard", "deadline", shutdownDeadline)
+	case <-impatient:
+		log.Warn("second signal received, exiting hard")
+	}
+	abandonWork()
+	os.Exit(1)
 }
 
 // handle writes one record, returning false if the offset must not advance past it.
