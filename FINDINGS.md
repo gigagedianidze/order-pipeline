@@ -444,3 +444,56 @@ a privileged container.
 
 A `docker-socket-proxy` with `CONTAINERS=1`, `NETWORKS=1`, `POST=0` was used instead. That is
 the only version of this arrangement where the restriction is real.
+
+## Day 9 — Wed 16 Sep (started 7 Sep)
+
+### Both target rates hold exactly
+
+| Target | Achieved | Accepted | Failed | Accept p99 | End-to-end p50 | End-to-end p99 |
+|---|---|---|---|---|---|---|
+| 100/s | 100.0/s | 3001 | 0 | 2.5 ms | 0.7 ms | 1.3 ms |
+| 1000/s | 1000.0/s | 30001 | 0 | 1.5 ms | 0.4 ms | 10.7 ms |
+
+Acceptance met: the achieved rate matches the target, and it is measured rather than assumed.
+
+Note that end-to-end p50 (0.4–0.7ms) is *lower* than accept latency, which is not a
+contradiction: accept latency includes the HTTP round trip from the client, while end-to-end is
+measured from the timestamp the API stamps on the event. They measure different spans.
+
+Also worth recording against Day 7: a single cold request measured 15.6ms end-to-end, while
+under sustained load the p50 is 0.4ms. A one-shot measurement of an idle system mostly measures
+the system waking up.
+
+### At 5000/s the two halves of the system come apart, and that is the whole point
+
+| | 1000/s | 5000/s |
+|---|---|---|
+| Achieved rate | 1000.0/s | 4999.9/s |
+| **Accept latency p50** | 0.8 ms | **0.9 ms** |
+| **End-to-end p50** | 0.4 ms | **8179 ms** |
+| End-to-end p99 | 10.7 ms | **18042 ms** |
+| Accepted → persisted | 30001 → 30001 | 75001 → 75001 |
+
+Ingress did not degrade at all. Accept latency at 5000/s is statistically indistinguishable
+from 1000/s, while the write path fell **eighteen seconds** behind — and lost nothing.
+
+This is the async architecture doing exactly what it is for, stated as a number rather than an
+opinion. A synchronous design would have pushed that 18 seconds onto the client as timeouts and
+5xx. Here the queue absorbs it: the API keeps its promise (202, durably in Kafka) and the
+backlog is paid down afterwards. The cost is equally concrete — read-after-write is no longer
+milliseconds but potentially many seconds, which is precisely the window Day 7 could not
+observe at idle.
+
+2 workers against 3 partitions is the bottleneck being measured here. Day 10 varies it.
+
+### The generator flags its own limits
+
+`scheduler_behind` counted 22630 of 75001 ticks at 5000/s. That is the harness reporting that
+*it* could not dispatch on schedule, not a finding about the pipeline — at 5000/s the interval
+is 200µs, below Windows timer granularity of roughly 1–15ms.
+
+Aggregate throughput was still accurate (4999.9/s against a 5000/s target), because lateness on
+individual ticks averages out. But sub-millisecond per-request timings at those rates should be
+read as approximate, and any Day 11 result at high rates has to be checked against this counter
+before it is believed. A benchmark that cannot tell "the system is slow" from "my generator is
+slow" is not measuring anything.

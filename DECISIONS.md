@@ -413,3 +413,53 @@ a graph when one is needed. Grafana would add a container, a provisioning direct
 of dashboard JSON files, and would not answer a single question that `histogram_quantile` and
 `deriv` do not already answer. It stays on the no-list unless the results in FINDINGS.md turn
 out to need a picture.
+
+## The load generator schedules send times; it does not loop
+
+A pool of N goroutines each doing "send, await response, send again" produces a rate of
+*N / latency*. The moment the system slows down, the generator slows down with it — so the
+offered load silently drops, the queue never builds, and the recorded latencies look fine.
+That is coordinated omission, and it is the easiest way to publish a benchmark that is
+confidently wrong.
+
+Request start times are therefore fixed in advance from the target rate: request *i* is due at
+`start + i·interval`, whatever happened to requests 0..i-1.
+
+## Latency is measured from the time a request was due, not from when it was sent
+
+The corollary, and the half that is usually forgotten. When the in-flight limit is reached, a
+request waits for a permit. Timing it from the moment it was finally sent would discard exactly
+that wait — which is real, is caused by the system being slow, and is what a client would
+actually experience.
+
+Measuring from the due time means saturation shows up as growing latency rather than as a
+quietly reduced send rate.
+
+## The generator reports when *it* is the bottleneck
+
+`scheduler_behind` counts ticks that were already more than one interval late before any
+request was dispatched. That is a statement about the load generator's own scheduling, not
+about the system under test, and conflating the two turns a laptop's limits into a finding
+about the architecture.
+
+It fires above roughly 1000/s on this host, where the per-request interval (200µs at 5000/s)
+falls below Windows timer granularity. Aggregate throughput stays accurate — 4999.9/s of a
+5000/s target — but per-request timing precision does not, so anything sub-millisecond at those
+rates should be read as approximate.
+
+## End-to-end latency is read from the data, not instrumented
+
+Every row carries `occurred_at` (when the API accepted it) and `processed_at` (when the worker
+persisted it), so the true pipeline latency is a SQL query — `percentile_cont` over
+`processed_at - occurred_at` — rather than something the generator has to trace.
+
+This is why both timestamps are on the row. It costs 16 bytes and removes any need for
+distributed tracing to answer the project's central question. It is also immune to clock skew
+between the client and the services, which a client-side measurement is not.
+
+## The generator waits for the pipeline to drain before measuring
+
+Percentiles taken while a backlog is still draining describe only the orders that happened to
+be fast already. The harness polls until the persisted count reaches the accepted count (or the
+drain deadline expires) and reports any shortfall as `MISSING`, so an incomplete measurement is
+labelled rather than quietly optimistic.

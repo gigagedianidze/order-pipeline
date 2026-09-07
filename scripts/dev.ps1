@@ -13,9 +13,11 @@ try {
         "logs"   { docker compose logs -f }
         "topics" { docker exec edp-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --describe }
         "smoke"  { go run ./cmd/smoke }
+        "load"    { go run ./cmd/loadgen -rate 100 -duration 30s }
+        "load-1k" { go run ./cmd/loadgen -rate 1000 -duration 30s }
         "build"  { go build ./... }
         "test"   { go test ./... }
-        default  { "targets: up down reset ps logs topics smoke build test" }
+        default  { "targets: up down reset ps logs topics smoke load load-1k build test" }
     }
 }
 finally { Pop-Location }

@@ -24,6 +24,12 @@ topics:        ## show topics and their partitions
 smoke:         ## Day 1 acceptance: connect to Postgres and Kafka, exit 0
 	$(GO) run ./cmd/smoke
 
+load:          ## steady 100/s for 30s
+	$(GO) run ./cmd/loadgen -rate 100 -duration 30s
+
+load-1k:       ## steady 1000/s for 30s
+	$(GO) run ./cmd/loadgen -rate 1000 -duration 30s
+
 build:
 	$(GO) build ./...
 

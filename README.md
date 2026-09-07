@@ -101,6 +101,35 @@ grpcurl -plaintext -d '{"page_size":3}' localhost:9090 order.v1.OrderService/Lis
 A 404 straight after a 202 is correct, not a bug — the write path is asynchronous. Listing uses
 keyset pagination with an opaque `next_page_token`, not `OFFSET`; see [DECISIONS.md](DECISIONS.md).
 
+## Load testing
+
+```sh
+go run ./cmd/loadgen -rate 1000 -duration 30s
+```
+
+Send times are scheduled in advance from the target rate, and latency is measured from the time
+a request was *due* rather than from when it was sent. A generator whose goroutines loop
+"send, await response, send again" produces a rate of N/latency — it slows down exactly when the
+system does, hiding the degradation it exists to find. See [DECISIONS.md](DECISIONS.md).
+
+End-to-end latency is read out of the data rather than traced: every row carries both
+`occurred_at` and `processed_at`, so the true pipeline latency is a `percentile_cont` query.
+
+```
+=== rate1000 ===
+target rate        1000.0/s
+achieved rate      1000.0/s   (100.0% of target)
+sent / accepted     30001 / 30001
+
+accept latency (client -> 202, measured from scheduled send time)
+  p50 0.8 ms   p95 1.2 ms   p99 1.5 ms
+end-to-end latency (api accepted -> row committed)
+  p50 0.4 ms   p95 1.5 ms   p99 10.7 ms
+```
+
+`scheduler behind` in the output means the generator could not dispatch on schedule — a
+statement about the harness, not the system. Check it before believing a high-rate result.
+
 ## Metrics
 
 Every service exposes `/metrics` on port 2112. Prometheus discovers them through the Docker
@@ -171,3 +200,5 @@ Following the 13-day plan in [PLAN.md](PLAN.md).
   the API for `GET /orders/{id}`; measured 15.6ms end-to-end API-to-database
 - **Day 8** — Prometheus metrics with Docker service discovery: latency histograms, outcome
   counters and consumer lag from two independent sources
+- **Day 9** — load harness with a scheduled (not emergent) send rate; holds 100/s and 1000/s
+  exactly, and reports when the generator itself is the bottleneck
