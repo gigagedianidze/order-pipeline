@@ -20,4 +20,11 @@ CREATE TABLE IF NOT EXISTS orders (
     CONSTRAINT orders_event_id_key UNIQUE (event_id)
 );
 
-CREATE INDEX IF NOT EXISTS orders_customer_id_idx ON orders (customer_id);
+-- Matches the keyset pagination order exactly, so a page is an index seek plus
+-- a sequential read rather than a sort of the whole table.
+CREATE INDEX IF NOT EXISTS orders_processed_at_order_id_idx
+    ON orders (processed_at DESC, order_id DESC);
+
+-- Same, for the customer-filtered variant of the same query.
+CREATE INDEX IF NOT EXISTS orders_customer_processed_idx
+    ON orders (customer_id, processed_at DESC, order_id DESC);

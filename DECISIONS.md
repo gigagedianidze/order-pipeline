@@ -279,3 +279,72 @@ Wrapping the payload in an envelope would mean the dead-letter topic has a diffe
 from the source topic, so replaying it needs a special consumer that no one writes. That is how
 dead-letter queues quietly become write-only. Byte-identical records can be replayed by the
 same worker after the cause is fixed.
+
+## Why gRPC is here at all
+
+The one-sentence justification, since the plan says to delete it if there isn't one:
+
+**Writes go `api → Kafka → worker → Postgres` asynchronously; reads go `api → gRPC → query →
+Postgres` synchronously. Those are different workloads with different failure modes, and the
+gRPC boundary is where they are separated.**
+
+Concretely, the read path can be scaled, tuned, rate-limited and taken down without touching
+ingest — a read-heavy hour adds `query` replicas and never risks accepting orders. Read
+failures are also *visible* rather than absorbed: the API translates gRPC codes to HTTP ones,
+so a read timeout is a 504 rather than a silent empty result.
+
+gRPC specifically, rather than a second HTTP service: this is an internal, schema-first,
+service-to-service call. The `.proto` is the contract, both sides are generated from it, and a
+field renamed on one side breaks compilation rather than becoming a `null` in production.
+
+## Keyset pagination, not OFFSET
+
+`ListOrders` pages on `(processed_at, order_id) < (cursor)` rather than `OFFSET n`.
+
+`OFFSET` makes the database produce and discard every skipped row, so page 1000 is far slower
+than page 1. Worse, it is *wrong* on a table that is being written to: rows inserted while a
+client pages will shift every later page, so rows get skipped or returned twice. This table is
+written to constantly, so that is not theoretical.
+
+The cursor anchors each page to a fixed point instead. Verified with `EXPLAIN (ANALYZE)`:
+
+```
+Limit  (actual time=0.011..0.021 rows=51)
+  ->  Index Only Scan using orders_processed_at_order_id_idx
+        Index Cond: (ROW(processed_at, order_id) < ROW(now(), '...'::uuid))
+```
+
+An index-only scan with the row comparison pushed into the index condition — no sort, no heap
+scan of skipped rows, and the cost is the same on page 1000 as on page 1. The row-value syntax
+`(a, b) < ($1, $2)` is what makes this a single seek; the equivalent
+`a < $1 OR (a = $1 AND b < $2)` is logically identical and does *not* reliably produce this plan.
+
+The token is base64url-encoded JSON, so it is opaque by contract and its shape can change
+without breaking clients holding an old one.
+
+## An extra row instead of a COUNT
+
+The page query fetches `pageSize + 1` rows and reports a next-page token only if the extra row
+appears. A `COUNT(*)` would scan the whole matching set to answer a question the client did not
+ask, and would be out of date by the time it returned.
+
+## The API dials the query service lazily
+
+`grpc.NewClient` does not block on the target being reachable. The API therefore starts and
+keeps accepting orders even while the read path is down — coupling ingress availability to a
+downstream read service would be a self-inflicted outage. A read attempted during that window
+gets a 503 mapped from `codes.Unavailable`, which is the truth.
+
+## gRPC reflection is enabled
+
+`grpcurl` and similar tools can call the service without being handed the `.proto`. On an
+internal service that is a real operability win. On a public endpoint it would be an
+information leak, and this is the reason it would be turned off there.
+
+## NotFound is normal traffic on the read path
+
+`GET /orders/{id}` returning 404 immediately after a 202 is correct behaviour, not a bug: the
+write path is asynchronous. Measured at idle, the gap between `occurred_at` and `processed_at`
+is around **15ms**, which is smaller than the round trip needed to observe it. Under load the
+window widens to whatever the consumer lag is — which is precisely why lag is the metric that
+matters (Day 8).

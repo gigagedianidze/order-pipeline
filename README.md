@@ -60,7 +60,7 @@ On Windows without GNU make, `scripts\dev.ps1 <target>` mirrors the Makefile:
 | Kafka            | `localhost:9092` | `kafka:19092` from inside Compose            |
 | PostgreSQL       | `localhost:5433` | 5432 inside; 5433 avoids a native PG install |
 | api (HTTP)       | `localhost:8080` | Day 2                                        |
-| query (gRPC)     | `localhost:9090` | Day 7                                        |
+| query (gRPC)     | `localhost:9090` | reflection enabled, so `grpcurl` needs no proto |
 | metrics          | `localhost:2112` | Day 8                                        |
 
 ## API
@@ -79,6 +79,34 @@ HTTP/1.1 202 Accepted
 **202, not 201** — the event is durably in Kafka, but no row exists yet. See
 [DECISIONS.md](DECISIONS.md). Invalid bodies get 400 with every problem listed at once;
 if the broker does not acknowledge the record, the client gets 503 rather than a false 202.
+
+### `GET /orders/{id}` and `GET /orders`
+
+Reads take a different route: `api` calls the `query` service over gRPC, which reads Postgres.
+
+```sh
+curl -s http://localhost:8080/orders/<order_id>
+curl -s "http://localhost:8080/orders?page_size=3&customer_id=cust-1"
+```
+
+Or call the gRPC service directly — reflection is enabled, so no `.proto` file is needed:
+
+```sh
+grpcurl -plaintext localhost:9090 list order.v1.OrderService
+grpcurl -plaintext -d '{"order_id":"<order_id>"}' localhost:9090 order.v1.OrderService/GetOrder
+grpcurl -plaintext -d '{"page_size":3}' localhost:9090 order.v1.OrderService/ListOrders
+```
+
+A 404 straight after a 202 is correct, not a bug — the write path is asynchronous. Listing uses
+keyset pagination with an opaque `next_page_token`, not `OFFSET`; see [DECISIONS.md](DECISIONS.md).
+
+### Regenerating the protobuf code
+
+The generated files are committed, so building needs only Go. To change the contract:
+
+```sh
+protoc --proto_path=proto   --go_out=. --go_opt=module=github.com/gigagedianidze/order-pipeline   --go-grpc_out=. --go-grpc_opt=module=github.com/gigagedianidze/order-pipeline   proto/order/v1/order.proto
+```
 
 ### Watching where events land
 
@@ -117,3 +145,5 @@ Following the 13-day plan in [PLAN.md](PLAN.md).
   group, close the pool — with a 15s deadline and a hard-exit fallback; services containerised
 - **Day 6** — retries with full jitter, SQLSTATE-based transient/poison classification, and a
   dead-letter queue: survived a 31s database outage with 0 lost and 0 dead-lettered
+- **Day 7** — gRPC read path: `query` service over Postgres with keyset pagination, called by
+  the API for `GET /orders/{id}`; measured 15.6ms end-to-end API-to-database

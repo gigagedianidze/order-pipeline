@@ -303,3 +303,62 @@ dlq_source_topic:orders, dlq_source_partition:2, dlq_source_offset:0, dlq_failed
 The partition never stalled and no crash loop occurred — the Day 4 behaviour where a bad record
 paused its partition indefinitely is now reserved for the one case that truly cannot make
 progress: Kafka itself being unreachable, so the record can be neither persisted nor parked.
+
+## Day 7 — Mon 14 Sep (started 7 Sep)
+
+### Both read paths return the identical order
+
+`grpcurl` straight to the query service, and `GET /orders/{id}` through the API's gRPC hop,
+returned the same order down to the nanosecond timestamps. Acceptance met.
+
+```
+occurred_at   2026-09-07T17:45:50.561895Z   (accepted by the API)
+processed_at  2026-09-07T17:45:50.577526Z   (persisted by the worker)
+```
+
+**15.6ms end-to-end**, API to database, through Kafka. Carrying both timestamps on the row was
+worth doing: pipeline latency is now measurable from the data itself, without any instrumentation,
+and Day 9's load harness gets a ground truth to check itself against.
+
+### Status codes survive the hop
+
+| Request | gRPC | HTTP |
+|---|---|---|
+| Unknown but valid UUID | `NotFound` | 404 |
+| `NOT-A-UUID` | `InvalidArgument` | 400 |
+| Query service down | `Unavailable` | 503 |
+| Query service slow | `DeadlineExceeded` | 504 |
+
+The `InvalidArgument` case is the one that is easy to get wrong. A malformed UUID reaches
+Postgres and comes back as SQLSTATE `22P02`, which naively becomes a 500 — a caller's typo
+reported as a server fault, and real faults then hidden among them. Reusing `store.IsRetryable`
+from Day 6 sorts it out: if an error is not retryable it is about the data, so it is the
+caller's problem, not ours.
+
+### The read-after-write window is smaller than the client's own overhead
+
+Five runs of "POST, then GET in a tight loop until 200": every single one returned 200 on the
+**first** GET, in 38–51ms. The 404 window that the 202 contract explicitly allows never
+materialised, because at idle the pipeline persists in ~15ms while `curl` takes ~40ms just to
+start.
+
+The window is real and the contract still needs it — under load it widens to whatever the
+consumer lag is. But it is worth knowing that a naive read-after-write test at idle will pass
+by accident and prove nothing. Day 10's loaded runs are where this gets a real answer.
+
+### `EXPLAIN` confirms the pagination claim, and the SQL syntax matters
+
+```
+Limit  (actual time=0.011..0.021 rows=51)  Buffers: shared hit=19
+  ->  Index Only Scan using orders_processed_at_order_id_idx
+        Index Cond: (ROW(processed_at, order_id) < ROW(now(), '...'::uuid))
+```
+
+Index-only scan, condition pushed into the index, no sort, 0.021ms — and the same cost on page
+1000 as on page 1.
+
+The detail that matters: the row-value form `(a, b) < ($1, $2)` produces this plan. The
+logically identical `a < $1 OR (a = $1 AND b < $2)` does not reliably produce it, because the
+planner cannot express that as a single index condition. Writing the "obvious" version would
+have given a correct answer with a much worse plan — and it would have looked fine in testing,
+where the table is small.
