@@ -21,6 +21,7 @@ import (
 	"github.com/gigagedianidze/order-pipeline/internal/broker"
 	"github.com/gigagedianidze/order-pipeline/internal/config"
 	orderv1 "github.com/gigagedianidze/order-pipeline/internal/gen/orderv1"
+	"github.com/gigagedianidze/order-pipeline/internal/metrics"
 	"github.com/gigagedianidze/order-pipeline/internal/order"
 
 	"google.golang.org/grpc"
@@ -67,6 +68,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	go metrics.Serve(ctx, cfg.MetricsAddr, log)
+
 	go func() {
 		log.Info("listening", "addr", cfg.APIAddr, "topic", cfg.KafkaTopic, "query", cfg.QueryGRPCAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -105,10 +108,12 @@ func createOrder(producer *broker.Producer, log *slog.Logger) http.HandlerFunc {
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&req); err != nil {
+			metrics.OrdersRejected.WithLabelValues("malformed_body").Inc()
 			writeError(w, http.StatusBadRequest, "malformed request body: "+err.Error())
 			return
 		}
 		if err := req.Validate(); err != nil {
+			metrics.OrdersRejected.WithLabelValues("validation").Inc()
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -117,8 +122,11 @@ func createOrder(producer *broker.Producer, log *slog.Logger) http.HandlerFunc {
 
 		// Partition key is the order id, so all events for one order land on one
 		// partition and are processed in order by exactly one consumer.
+		started := time.Now()
 		partition, offset, err := producer.Publish(r.Context(), evt.OrderID, evt)
+		metrics.ProduceDuration.Observe(time.Since(started).Seconds())
 		if err != nil {
+			metrics.OrdersRejected.WithLabelValues("produce_failed").Inc()
 			// The broker did not acknowledge, so the order does not exist as far
 			// as this system is concerned. Say so, rather than accepting it.
 			log.Error("publish failed", "order_id", evt.OrderID, "err", err)
@@ -126,6 +134,7 @@ func createOrder(producer *broker.Producer, log *slog.Logger) http.HandlerFunc {
 			return
 		}
 
+		metrics.OrdersAccepted.Inc()
 		log.Info("order accepted",
 			"order_id", evt.OrderID,
 			"event_id", evt.EventID,

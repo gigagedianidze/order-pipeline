@@ -362,3 +362,85 @@ logically identical `a < $1 OR (a = $1 AND b < $2)` does not reliably produce it
 planner cannot express that as a single index condition. Writing the "obvious" version would
 have given a correct answer with a much worse plan — and it would have looked fine in testing,
 where the table is small.
+
+## Day 8 — Tue 15 Sep (started 7 Sep)
+
+### The two acceptance queries answer
+
+```promql
+# "what is my p99 processing latency right now"
+histogram_quantile(0.99, sum by (le) (rate(order_processing_duration_seconds_bucket{status="persisted"}[1m])))
+  -> 0.0024s        (p50: 0.0006s)
+
+# end-to-end, API accept -> row committed
+histogram_quantile(0.99, sum by (le) (rate(order_end_to_end_latency_seconds_bucket[1m])))
+  -> 0.0050s
+
+# "is my consumer lag growing or flat"
+sum(deriv(consumer_lag[1m]))
+  -> 0.00 records/sec   (positive = falling behind)
+```
+
+`deriv` rather than the raw value is the point. A steady lag of 5000 is a system keeping up with
+a backlog; a lag of 500 climbing by 100/s is a system heading for trouble. The value alone
+cannot tell those apart.
+
+### The lag metric had a hole exactly where it mattered
+
+The worker exports `consumer_lag`. Stopping every worker while load continued produced this:
+
+| Source | Reported lag |
+|---|---|
+| `consumer_lag` (from the workers) | **0, 0, 0** |
+| Reality (broker-side) | **629, 668, 626 — 1923 records** |
+
+A completely healthy-looking dashboard with a growing backlog behind it. The workers are the
+only source of the metric, so when they die the series goes stale at its last value — and
+Prometheus serves that stale sample for five minutes. **Silence looked identical to success.**
+
+Fixed by adding `kafka-exporter`, which reads group lag from the broker and does not care
+whether any consumer is alive. The worker gauge is kept as well: it is per-worker and shows
+what *this* member sees, which is useful for a different question. The rule the mistake
+teaches is general — a health signal must not be produced by the thing whose health it reports.
+
+### A rebalance during a backlog produced 626 duplicates, absorbed silently
+
+Restarting two workers against the 1923-record backlog:
+
+| Worker | Persisted | Duplicates |
+|---|---|---|
+| worker-2 (started first, owned all 3 partitions) | **1923** | 0 |
+| worker-1 (joined second, triggering a rebalance) | 0 | **626** |
+
+worker-1 was handed partitions starting from the last *committed* offset, which lagged what
+worker-2 had already written — offsets are committed once per poll batch, so a large in-flight
+batch is written well before its offset advances. 626 records were therefore processed twice.
+
+This is at-least-once behaving exactly as documented, and it is the first time the project has
+actually *observed* it rather than argued for it. Every one of those 626 was absorbed by
+`UNIQUE (event_id)` with no duplicate rows and no errors — Day 4's design earning its keep.
+
+It also justifies the metric label. `orders_processed_total{status="duplicate"}` made this
+visible; a bare "processed" counter would have hidden it completely, and a counter of "errors"
+would have hidden it too, since a duplicate is not an error.
+
+### Docker's embedded DNS cannot be used for Prometheus service discovery
+
+`--scale worker=N` means worker addresses are unknown in advance, so targets have to be
+discovered. `dns_sd_configs` on the Compose service name looks like the obvious answer and
+fails: Prometheus queries the fully-qualified `worker.` (with the trailing dot) and Docker's
+embedded resolver never answers, producing `i/o timeout` rather than an empty result.
+
+`docker_sd_configs` works and picks up scaled workers within one refresh interval. Two details
+it needs: containers are discovered once *per network*, so without a `keep` on the network name
+every counter appears doubled; and Prometheus reads `/networks` as well as `/containers`.
+
+### Mounting the Docker socket `:ro` is security theatre
+
+Prometheus runs as `nobody` and got `permission denied` on the socket. The quick fix is
+`user: root` — and a `:ro` mount looks like it makes that safe. It does not: read-only applies
+to the socket *file*, not to the API behind it, so anything that can reach it can still create
+a privileged container.
+
+A `docker-socket-proxy` with `CONTAINERS=1`, `NETWORKS=1`, `POST=0` was used instead. That is
+the only version of this arrangement where the restriction is real.

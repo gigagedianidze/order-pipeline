@@ -80,6 +80,7 @@ services:
       KAFKA_BROKERS: kafka:19092
       API_ADDR: ":8080"
       QUERY_GRPC_ADDR: query:9090
+      METRICS_ADDR: ":2112"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -96,6 +97,7 @@ services:
     environment:
       POSTGRES_DSN: postgres://orders:orders@postgres:5432/orders?sslmode=disable
       QUERY_LISTEN_ADDR: ":9090"
+      METRICS_ADDR: ":2112"
     depends_on:
       postgres:
         condition: service_healthy
@@ -110,6 +112,7 @@ services:
     environment:
       KAFKA_BROKERS: kafka:19092
       POSTGRES_DSN: postgres://orders:orders@postgres:5432/orders?sslmode=disable
+      METRICS_ADDR: ":2112"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -121,6 +124,59 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
 
+  # Reports consumer-group lag by asking the broker directly.
+  #
+  # The workers export a consumer_lag gauge too, and that is not enough on its
+  # own: they are the only source of it, so when every worker dies the series
+  # goes stale at its last value and the dashboard shows a healthy 0 while the
+  # backlog grows. Measured — see FINDINGS.md. Lag has to be observed by
+  # something that is not the thing being observed.
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    container_name: edp-kafka-exporter
+    command:
+      - --kafka.server=kafka:19092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Exposes a read-only slice of the Docker API so Prometheus can discover
+  # containers without being handed the daemon socket.
+  #
+  # Mounting the socket into Prometheus directly, even :ro, would be security
+  # theatre: the read-only flag applies to the socket *file*, not to the API
+  # behind it, so anything that can reach it can still create a privileged
+  # container. This proxy allows GET /containers and nothing else.
+  dockerproxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: edp-dockerproxy
+    environment:
+      CONTAINERS: 1
+      # Prometheus reads /networks too, to attach network labels to each target.
+      NETWORKS: 1
+      # Everything else stays denied, including every write verb.
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.6.0
+    container_name: edp-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=24h
+    depends_on:
+      - dockerproxy
+    restart: unless-stopped
+
 volumes:
   kafka-data:
   pg-data:
+  prom-data:

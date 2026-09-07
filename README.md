@@ -61,7 +61,8 @@ On Windows without GNU make, `scripts\dev.ps1 <target>` mirrors the Makefile:
 | PostgreSQL       | `localhost:5433` | 5432 inside; 5433 avoids a native PG install |
 | api (HTTP)       | `localhost:8080` | Day 2                                        |
 | query (gRPC)     | `localhost:9090` | reflection enabled, so `grpcurl` needs no proto |
-| metrics          | `localhost:2112` | Day 8                                        |
+| Prometheus       | `localhost:9091` | expression browser and API                   |
+| metrics          | `:2112` per service | scraped via Docker service discovery      |
 
 ## API
 
@@ -99,6 +100,27 @@ grpcurl -plaintext -d '{"page_size":3}' localhost:9090 order.v1.OrderService/Lis
 
 A 404 straight after a 202 is correct, not a bug — the write path is asynchronous. Listing uses
 keyset pagination with an opaque `next_page_token`, not `OFFSET`; see [DECISIONS.md](DECISIONS.md).
+
+## Metrics
+
+Every service exposes `/metrics` on port 2112. Prometheus discovers them through the Docker
+API, so `--scale worker=N` needs no configuration change — new workers are scraped within one
+refresh interval. Open the expression browser at <http://localhost:9091>.
+
+The two queries worth knowing:
+
+```promql
+# p99 write latency right now
+histogram_quantile(0.99, sum by (le) (rate(order_processing_duration_seconds_bucket{status="persisted"}[1m])))
+
+# is the consumer group falling behind? (positive = yes)
+sum(deriv(kafka_consumergroup_lag{consumergroup="order-processors"}[1m]))
+```
+
+Lag is exported twice on purpose: by the workers (what this member sees) and by
+`kafka-exporter` (what the broker sees). The workers' gauge goes stale at its last value when
+they die — reporting a healthy 0 while a backlog grows — which is exactly when lag matters.
+See [FINDINGS.md](FINDINGS.md).
 
 ### Regenerating the protobuf code
 
@@ -147,3 +169,5 @@ Following the 13-day plan in [PLAN.md](PLAN.md).
   dead-letter queue: survived a 31s database outage with 0 lost and 0 dead-lettered
 - **Day 7** — gRPC read path: `query` service over Postgres with keyset pagination, called by
   the API for `GET /orders/{id}`; measured 15.6ms end-to-end API-to-database
+- **Day 8** — Prometheus metrics with Docker service discovery: latency histograms, outcome
+  counters and consumer lag from two independent sources

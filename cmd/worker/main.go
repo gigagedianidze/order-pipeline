@@ -13,16 +13,19 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gigagedianidze/order-pipeline/internal/broker"
 	"github.com/gigagedianidze/order-pipeline/internal/config"
+	"github.com/gigagedianidze/order-pipeline/internal/metrics"
 	"github.com/gigagedianidze/order-pipeline/internal/order"
 	"github.com/gigagedianidze/order-pipeline/internal/retry"
 	"github.com/gigagedianidze/order-pipeline/internal/store"
 
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -89,6 +92,8 @@ func main() {
 	var c counters
 	policy := retry.DefaultPolicy()
 	go heartbeat(fetchCtx, log, owned, &c)
+	go metrics.Serve(fetchCtx, cfg.MetricsAddr, log)
+	go pollLag(fetchCtx, client, cfg.KafkaGroupID, owned, log)
 
 	// A shutdown that hangs is worse than one that is abrupt: the container is
 	// killed anyway, but later and less predictably. Once the signal arrives the
@@ -193,6 +198,45 @@ func main() {
 		"dlq_total", c.dlq.Load())
 }
 
+// pollLag publishes the consumer group's lag as a gauge.
+//
+// Lag is read from the group's own committed offsets rather than derived from
+// what this worker happens to have fetched. The difference matters exactly when
+// it matters most: a worker that has stalled or paused a partition fetches
+// nothing, so a fetch-derived gauge would go stale and flat at the precise moment
+// lag is climbing.
+func pollLag(ctx context.Context, client *kgo.Client, group string, owned *broker.Assignment, log *slog.Logger) {
+	admin := kadm.NewClient(client)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			metrics.PartitionsOwned.Set(float64(owned.Count()))
+
+			lags, err := admin.Lag(ctx, group)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Warn("lag poll failed", "err", err)
+				}
+				continue
+			}
+			described, ok := lags[group]
+			if !ok {
+				continue
+			}
+			for topic, partitions := range described.Lag {
+				for partition, l := range partitions {
+					metrics.ConsumerLag.WithLabelValues(topic, strconv.Itoa(int(partition))).Set(float64(l.Lag))
+				}
+			}
+		}
+	}
+}
+
 // handle processes one record and reports whether the offset may advance past it.
 //
 // It returns false only when the worker genuinely cannot make progress — which,
@@ -208,10 +252,12 @@ func handle(ctx context.Context, db *store.Store, dlq *broker.DLQ, log *slog.Log
 		return deadLetter(ctx, dlq, log, rec, broker.ReasonPoison, err, 0, c)
 	}
 
+	started := time.Now()
 	attempts := 0
 	err := retry.Do(ctx, policy, store.IsRetryable,
 		func(attempt int, delay time.Duration, err error) {
 			c.retries.Add(1)
+			metrics.Retries.Inc()
 			log.Warn("write failed, retrying",
 				"attempt", attempt+1,
 				"delay", delay,
@@ -226,12 +272,20 @@ func handle(ctx context.Context, db *store.Store, dlq *broker.DLQ, log *slog.Log
 			}
 			if inserted {
 				c.processed.Add(1)
+				metrics.OrdersProcessed.WithLabelValues(metrics.OutcomePersisted).Inc()
+				metrics.ProcessingDuration.WithLabelValues(metrics.OutcomePersisted).Observe(time.Since(started).Seconds())
+				// Only measured for genuinely new orders: a duplicate's
+				// "latency" would be the age of the original event and would
+				// pollute the distribution with irrelevant large values.
+				metrics.EndToEndLatency.Observe(time.Since(evt.OccurredAt).Seconds())
 				log.Info("order persisted",
 					"partition", rec.Partition, "offset", rec.Offset,
 					"order_id", evt.OrderID, "event_id", evt.EventID,
 					"total_cents", evt.TotalCents, "attempts", attempts)
 			} else {
 				c.duplicates.Add(1)
+				metrics.OrdersProcessed.WithLabelValues(metrics.OutcomeDuplicate).Inc()
+				metrics.ProcessingDuration.WithLabelValues(metrics.OutcomeDuplicate).Observe(time.Since(started).Seconds())
 				log.Info("duplicate event ignored",
 					"partition", rec.Partition, "offset", rec.Offset,
 					"order_id", evt.OrderID, "event_id", evt.EventID)
@@ -271,6 +325,8 @@ func deadLetter(ctx context.Context, dlq *broker.DLQ, log *slog.Logger, rec *kgo
 		return false
 	}
 	c.dlq.Add(1)
+	metrics.DeadLettered.WithLabelValues(string(reason)).Inc()
+	metrics.OrdersProcessed.WithLabelValues(metrics.OutcomeDeadLetter).Inc()
 	return true
 }
 

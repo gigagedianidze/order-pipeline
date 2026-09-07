@@ -18,6 +18,7 @@ import (
 
 	"github.com/gigagedianidze/order-pipeline/internal/config"
 	orderv1 "github.com/gigagedianidze/order-pipeline/internal/gen/orderv1"
+	"github.com/gigagedianidze/order-pipeline/internal/metrics"
 	"github.com/gigagedianidze/order-pipeline/internal/store"
 
 	"google.golang.org/grpc"
@@ -48,7 +49,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := grpc.NewServer()
+	go metrics.Serve(ctx, cfg.MetricsAddr, log)
+
+	// One interceptor instruments every RPC, so a new method is measured the
+	// moment it exists rather than whenever someone remembers to add a timer.
+	srv := grpc.NewServer(grpc.UnaryInterceptor(instrument))
 	orderv1.RegisterOrderServiceServer(srv, &server{db: db, log: log})
 	// Reflection lets grpcurl and similar tools call the service without being
 	// handed the .proto file. On an internal service that is a genuine
@@ -78,6 +83,18 @@ func main() {
 		srv.Stop()
 	}
 	log.Info("stopped")
+}
+
+// instrument records handling time and status code for every unary RPC.
+func instrument(ctx context.Context, req any, info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler) (any, error) {
+
+	started := time.Now()
+	res, err := handler(ctx, req)
+	metrics.GRPCDuration.
+		WithLabelValues(info.FullMethod, status.Code(err).String()).
+		Observe(time.Since(started).Seconds())
+	return res, err
 }
 
 type server struct {

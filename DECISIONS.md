@@ -348,3 +348,68 @@ write path is asynchronous. Measured at idle, the gap between `occurred_at` and 
 is around **15ms**, which is smaller than the round trip needed to observe it. Under load the
 window widens to whatever the consumer lag is — which is precisely why lag is the metric that
 matters (Day 8).
+
+## Six metrics, chosen to answer specific questions
+
+| Metric | Type | Question it answers |
+|---|---|---|
+| `consumer_lag` / `kafka_consumergroup_lag` | gauge | Am I keeping up? |
+| `order_processing_duration_seconds` | histogram | How long does one write take? |
+| `order_end_to_end_latency_seconds` | histogram | What does a user actually wait? |
+| `orders_processed_total{status}` | counter | What is happening, and how often? |
+| `retries_total` / `dlq_total{reason}` | counter | Is it failing, and is it giving up? |
+| `consumer_partitions_owned` | gauge | Is this worker doing anything at all? |
+
+A metric nobody queries is a metric nobody maintains, so the set is deliberately small and each
+one has a question attached.
+
+## Histograms, not averages, and custom buckets
+
+The question is "what is my p99", and an average hides exactly the tail that matters: a
+p50 of 0.6ms with a p99 of 2.4ms and one with a p99 of 2.4s have the same average.
+
+The buckets are hand-chosen around the measured range (1ms to 30s) rather than left at the
+Prometheus defaults, which start at 5ms. With defaults, a system whose p50 is 0.6ms would land
+almost every observation in the first bucket and `histogram_quantile` would interpolate inside
+it — returning a confident, precise, meaningless number. Buckets have to be chosen after you
+know roughly what you are measuring, which is why this came after Day 7 rather than before.
+
+## Lag is exported twice, on purpose
+
+The worker exports `consumer_lag` and `kafka-exporter` exports `kafka_consumergroup_lag`. That
+is redundant and both are kept, because they fail differently.
+
+The worker's gauge disappears when workers do — and it does not disappear cleanly, it goes
+*stale at its last value*, so Prometheus keeps serving a healthy 0 for five minutes while the
+backlog grows. Measured, not theorised; see FINDINGS.md. The exporter asks the broker and does
+not care whether any consumer is alive.
+
+**A health signal must not be produced by the thing whose health it reports.** The worker gauge
+is still worth keeping for the different question it answers — what *this* member sees, which
+is what makes an idle or stalled worker visible.
+
+## Metrics are served on their own port
+
+Port 2112, separate from the service's own traffic. Metrics need to stay scrapeable precisely
+when the main listener is saturated, and they should not be exposed wherever the service is —
+`/metrics` leaks internal structure and is not something to publish alongside a public API.
+
+## Prometheus discovers targets from Docker, not from a static list
+
+`--scale worker=N` means worker addresses do not exist until the containers do. `dns_sd_configs`
+on the Compose service name is the obvious approach and does not work — Docker's embedded DNS
+does not answer Prometheus's fully-qualified query. `docker_sd_configs` does, and new workers
+appear within one refresh interval.
+
+The daemon is reached through `docker-socket-proxy` with only `CONTAINERS` and `NETWORKS`
+enabled. Mounting the socket into Prometheus with `:ro` would *look* equivalent and is not: the
+flag applies to the socket file, not to the API, so anything that can reach it can still create
+a privileged container.
+
+## No Grafana
+
+Prometheus and PromQL answer the questions this project asks, and its expression browser draws
+a graph when one is needed. Grafana would add a container, a provisioning directory and a set
+of dashboard JSON files, and would not answer a single question that `histogram_quantile` and
+`deriv` do not already answer. It stays on the no-list unless the results in FINDINGS.md turn
+out to need a picture.

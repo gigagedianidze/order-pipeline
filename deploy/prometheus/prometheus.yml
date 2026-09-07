@@ -1,0 +1,50 @@
+global:
+  scrape_interval: 5s      # short, because the experiments are minutes long
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Discover targets from the Docker daemon rather than listing them.
+  #
+  # Static targets cannot express `--scale worker=N`: the addresses are not known
+  # until the containers exist. Compose's embedded DNS is the obvious
+  # alternative, but it does not answer the fully-qualified A query Prometheus
+  # sends ("worker." with the trailing dot), so dns_sd times out. Asking Docker
+  # directly works, and picks up scaled workers within one refresh interval with
+  # no configuration change.
+  # Broker-side lag, independent of whether any consumer is alive.
+  - job_name: kafka-exporter
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  - job_name: services
+    docker_sd_configs:
+      # Not the socket itself — a proxy that allows only container listing.
+      - host: tcp://dockerproxy:2375
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["com.docker.compose.project=eventdriven"]
+
+    relabel_configs:
+      # Only the Go services expose /metrics; Kafka, Postgres and Prometheus
+      # itself are discovered too and must be dropped.
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        regex: "api|worker|query"
+        action: keep
+
+      # Every container is discovered once per network it is attached to. Without
+      # this, a container on two networks is scraped twice and every counter
+      # appears doubled.
+      - source_labels: [__meta_docker_network_name]
+        regex: "eventdriven_default"
+        action: keep
+
+      - source_labels: [__meta_docker_network_ip]
+        target_label: __address__
+        replacement: "$1:2112"
+
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        target_label: job
+      - source_labels: [__meta_docker_container_name]
+        regex: "/(.*)"
+        target_label: instance
