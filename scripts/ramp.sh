@@ -20,7 +20,7 @@ RATES=("$@")
 DURATION=${DURATION:-15s}
 PROM=${PROM:-http://localhost:9091}
 GROUP=order-processors
-OUT=${OUT:-ramp.tsv}
+OUT=${OUT:-results/ramp.tsv}
 
 psql_() { MSYS_NO_PATHCONV=1 docker exec edp-postgres psql -U orders -d orders -t -A -c "$1"; }
 promq() {
@@ -34,7 +34,7 @@ for R in "${RATES[@]}"; do
   TAG="ramp-${R}"
   T0=$(date +%s)
   ./bin/loadgen.exe -rate "$R" -duration "$DURATION" -tag "$TAG" \
-      -drain 600s -json "reports/${TAG}.json" >"reports/${TAG}.txt" 2>&1
+      -drain 600s -json "results/reports/${TAG}.json" >"results/reports/${TAG}.txt" 2>&1
   T1=$(date +%s)
   W=$((T1 - T0))
 
@@ -42,7 +42,7 @@ for R in "${RATES[@]}"; do
   DLQ=$(promq "sum(increase(dlq_total[${W}s]))" "$T1")
   RETRIES=$(promq "sum(increase(retries_total[${W}s]))" "$T1")
 
-  python - "$R" "reports/${TAG}.json" "$PEAK_LAG" "$DLQ" "$RETRIES" <<'PY' | tee -a "$OUT"
+  python - "$R" "results/reports/${TAG}.json" "$PEAK_LAG" "$DLQ" "$RETRIES" <<'PY' | tee -a "$OUT"
 import json, sys
 rate, path, lag, dlq, retries = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 r = json.load(open(path))

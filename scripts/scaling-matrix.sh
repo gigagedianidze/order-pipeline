@@ -19,7 +19,7 @@ RATE=${RATE:-5000}
 DURATION=${DURATION:-10s}
 PROM=${PROM:-http://localhost:9091}
 GROUP=order-processors
-OUT=${OUT:-scaling-p${PARTITIONS}.tsv}
+OUT=${OUT:-results/scaling-p${PARTITIONS}.tsv}
 
 k()  { MSYS_NO_PATHCONV=1 docker exec edp-kafka /opt/kafka/bin/"$@"; }
 psql_() { MSYS_NO_PATHCONV=1 docker exec edp-postgres psql -U orders -d orders -t -A -c "$1"; }
@@ -72,7 +72,7 @@ for N in "${WORKERS[@]}"; do
 
   T0=$(date +%s)
   ./bin/loadgen.exe -rate "$RATE" -duration "$DURATION" -tag "$TAG" \
-      -drain 600s -json "reports/${TAG}.json" >"reports/${TAG}.txt" 2>&1
+      -drain 600s -json "results/reports/${TAG}.json" >"results/reports/${TAG}.txt" 2>&1
   T1=$(date +%s)
   WINDOW=$((T1 - T0))
 

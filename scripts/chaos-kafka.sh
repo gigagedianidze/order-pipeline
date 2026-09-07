@@ -16,7 +16,7 @@ TAG=${TAG:-chaos-kafka}
 echo "load: ${RATE}/s for ${DURATION}; kafka down for ${OUTAGE}s starting at t+20s"
 
 ./bin/loadgen.exe -rate "$RATE" -duration "$DURATION" -tag "$TAG" \
-    -drain 300s -json "reports/${TAG}.json" >"reports/${TAG}.txt" 2>&1 &
+    -drain 300s -json "results/reports/${TAG}.json" >"results/reports/${TAG}.txt" 2>&1 &
 LOAD_PID=$!
 
 sleep 20

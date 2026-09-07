@@ -30,6 +30,18 @@ load:          ## steady 100/s for 30s
 load-1k:       ## steady 1000/s for 30s
 	$(GO) run ./cmd/loadgen -rate 1000 -duration 30s
 
+matrix:        ## scaling matrix: 3 partitions, 1/2/4/8 workers
+	bash scripts/scaling-matrix.sh 3 1 2 4 8
+
+ramp:          ## ramp offered load until something breaks
+	bash scripts/ramp.sh 1000 2500 5000 10000 20000
+
+chaos-db:      ## remove PostgreSQL for 90s under load
+	bash scripts/chaos-db-outage.sh
+
+chaos-kafka:   ## remove the broker for 45s under load
+	bash scripts/chaos-kafka.sh
+
 build:
 	$(GO) build ./...
 

@@ -15,9 +15,11 @@ try {
         "smoke"  { go run ./cmd/smoke }
         "load"    { go run ./cmd/loadgen -rate 100 -duration 30s }
         "load-1k" { go run ./cmd/loadgen -rate 1000 -duration 30s }
+        "matrix"  { bash scripts/scaling-matrix.sh 3 1 2 4 8 }
+        "ramp"    { bash scripts/ramp.sh 1000 2500 5000 10000 20000 }
         "build"  { go build ./... }
         "test"   { go test ./... }
-        default  { "targets: up down reset ps logs topics smoke load load-1k build test" }
+        default  { "targets: up down reset ps logs topics smoke load load-1k matrix ramp build test" }
     }
 }
 finally { Pop-Location }

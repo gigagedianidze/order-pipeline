@@ -15,7 +15,7 @@ TAG=${TAG:-chaos-db}
 echo "load: ${RATE}/s for ${DURATION}; postgres down for ${OUTAGE}s starting at t+20s"
 
 ./bin/loadgen.exe -rate "$RATE" -duration "$DURATION" -tag "$TAG" \
-    -drain 600s -json "reports/${TAG}.json" >"reports/${TAG}.txt" 2>&1 &
+    -drain 600s -json "results/reports/${TAG}.json" >"results/reports/${TAG}.txt" 2>&1 &
 LOAD_PID=$!
 
 sleep 20
