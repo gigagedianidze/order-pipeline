@@ -86,3 +86,74 @@ A worker that owns no partitions is silent, and silence is indistinguishable fro
 a log file. The 15-second heartbeat reports `owns` and `partition_count`, so "idle because
 the group had more members than partitions" is legible at a glance — the exact condition the
 Day 10 scaling experiment runs into.
+
+## At-least-once delivery with an idempotent write, not exactly-once
+
+Kafka can offer effectively-once processing through transactions: the consumer's offset commit
+and its output are written in one transaction, so a partially-processed batch is rolled back.
+It is real, and it is the wrong tool here.
+
+Kafka transactions are exactly-once *within Kafka* — a read-process-write loop where the
+output is another Kafka topic. This system's output is a row in PostgreSQL, which is outside
+that transaction. Making the pair atomic requires either a distributed transaction across
+Kafka and Postgres, or the transactional-outbox pattern: substantial machinery, and a
+permanent tax on every future change.
+
+The alternative costs one database constraint. Delivery is at-least-once, the same event may
+arrive several times, and `UNIQUE (event_id)` with `ON CONFLICT DO NOTHING` makes the second
+and subsequent arrivals no-ops. Correctness is enforced by the database rather than by
+application logic that a future refactor can bypass, and the failure mode is a wasted round
+trip instead of a duplicated order.
+
+**What it costs:** duplicate *processing* still happens, so any side effect that is not a
+database write — sending an email, charging a card, calling a third party — is not covered by
+this and needs its own idempotency key. Saying that out loud is the difference between
+understanding the guarantee and reciting it.
+
+## Offsets are committed only after the write succeeds
+
+Auto-commit advances offsets on a timer, with no relationship to whether the work was done.
+A worker that crashes after an auto-commit but before its write loses those messages
+permanently — the group resumes past records that were never persisted.
+
+So: `DisableAutoCommit`, process, then `CommitRecords` for exactly the records that reached
+Postgres. Committing after the write means a crash between the two causes *redelivery*,
+which the idempotent write absorbs. That asymmetry is the whole design — err toward doing
+work twice, never toward skipping it.
+
+## A failed write pauses its partition
+
+Stopping at the first failed record in a poll is *not* sufficient. The client's fetch position
+has already moved past that record, so the next poll delivers the records behind it; those
+succeed, and committing them advances the offset past the failure — losing it silently. This
+was measured, not theorised: a failure at offset 20 ended with the group committed at 22 and
+lag 0.
+
+The fix is `PauseFetchPartitions` on the affected partition. Nothing behind the failure is
+fetched, so nothing behind it can be committed, and the uncommitted record is redelivered on
+the next rebalance or restart. Only the affected partition stalls; the other two keep
+processing. Day 6 replaces the indefinite pause with bounded retries and a dead-letter queue.
+
+## `ON CONFLICT (event_id)`, with a named target rather than a bare `DO NOTHING`
+
+A bare `ON CONFLICT DO NOTHING` swallows a violation of *any* unique constraint. That would
+also silently discard a genuine anomaly — a different `event_id` carrying an `order_id` that
+already exists, which is a data conflict, not a redelivery.
+
+Naming the target means only redelivery is treated as benign; anything else surfaces as an
+error, stalls its partition, and gets seen. Verified: an event with a new `event_id` and an
+existing `order_id` raises `duplicate key value violates unique constraint "orders_pkey"`
+rather than being quietly dropped.
+
+## Schema applied from an embedded `schema.sql` at startup
+
+`CREATE TABLE IF NOT EXISTS` is idempotent, so every worker can run it and the Nth start is a
+no-op — no migration container, no ordering requirement between services. It cannot express a
+change to an existing column, which is exactly why real systems use versioned migrations
+(goose, golang-migrate). For a fixed one-table schema in a 13-day lab, the extra tool would be
+ceremony.
+
+## Connection pool capped at 10
+
+Deliberately modest. Day 11 wants pool exhaustion to be a reachable, observable failure mode
+rather than something hidden behind a default large enough to never bite locally.

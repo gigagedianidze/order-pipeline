@@ -96,3 +96,6 @@ Following the 13-day plan in [PLAN.md](PLAN.md).
 - **Day 2** — `POST /orders` validates, assigns a UUID, produces keyed by `order_id`, returns 202
 - **Day 3** — worker joins consumer group `order-processors`; partition assignment and
   rebalancing measured (see [FINDINGS.md](FINDINGS.md): 4 workers, 3 partitions, one idle)
+- **Day 4** — idempotent persistence: `UNIQUE (event_id)` + `ON CONFLICT DO NOTHING`, offsets
+  committed only after a successful write, failed writes pause their partition rather than
+  being committed past
