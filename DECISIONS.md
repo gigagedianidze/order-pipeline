@@ -73,3 +73,16 @@ events about the same order.
 
 An unrecognised field means the client and the API disagree about the contract. Silently
 ignoring it is how a typo'd `total_cents` gets discarded and a bug takes a week to find.
+
+## One consumer group, `order-processors`, not one group per worker
+
+Members of a *group* divide the partitions between them; separate groups each receive every
+message. Workers must share a group or every order would be processed N times. Day 4's
+idempotent write protects against duplicate *delivery*, not against a misconfigured topology.
+
+## The worker logs a heartbeat even when it owns nothing
+
+A worker that owns no partitions is silent, and silence is indistinguishable from a crash in
+a log file. The 15-second heartbeat reports `owns` and `partition_count`, so "idle because
+the group had more members than partitions" is legible at a glance — the exact condition the
+Day 10 scaling experiment runs into.
