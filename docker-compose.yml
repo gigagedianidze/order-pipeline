@@ -1,0 +1,73 @@
+# Single-node Kafka (KRaft, no ZooKeeper) + PostgreSQL 16.
+# Deliberately one broker, replication factor 1: this is a local lab, not a cluster.
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: edp-kafka
+    ports:
+      - "9092:9092"          # host -> broker (PLAINTEXT_HOST listener)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      # Two listeners on purpose: containers reach the broker as kafka:19092,
+      # processes on the Windows host reach it as localhost:9092. Getting this
+      # wrong is the classic "connects, then hangs forever" Kafka-in-Docker trap.
+      KAFKA_LISTENERS: PLAINTEXT://:19092,PLAINTEXT_HOST://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+
+  # Runs once, creates the topics, exits. Auto-create is off so partition
+  # counts are explicit and reproducible.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: edp-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    # A single-element list: compose would otherwise shell-split a plain
+    # string and hand `sh -c` only the first word.
+    command:
+      - >-
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create --if-not-exists --topic orders --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create --if-not-exists --topic orders.dlq --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --describe
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: edp-postgres
+    ports:
+      - "5433:5432"   # 5433 on the host: a native PostgreSQL service already owns 5432 here
+    environment:
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+      POSTGRES_DB: orders
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  kafka-data:
+  pg-data:
