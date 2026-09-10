@@ -500,3 +500,128 @@ once it is on the screen. For the ramp, the system is broken when:
 introduced to do, and telling those two apart is most of what this system exists to demonstrate.
 A design that absorbs a 5× overload as 18 seconds of lag and zero losses has not failed; one
 that returns 503 at the same load has.
+
+## A paused partition is resumed by a separate goroutine, after a broker ping
+
+The pause from Day 4 is only ever meant to last as long as the outage that caused it, and for
+eight days nothing ended it. Three details make the resume correct rather than merely present.
+
+**It ticks rather than reacting to an event.** There is no signal that says "Kafka is back";
+the only way to find out is to ask.
+
+**It runs on its own goroutine.** `PollFetches` blocks, so if every partition is paused the poll
+loop is parked with nothing to fetch and can never resume anything. Putting the resume in the
+loop would work in every case except the one that matters.
+
+**It pings the broker before resuming.** Resuming into a continuing outage means the record
+fails again instantly and the partition is re-paused: churn, log noise, and no progress. One
+metadata round trip buys the difference between recovering and thrashing.
+
+The alternative — exit the process and let the orchestrator restart it — is simpler and would
+also work. It is worse because it throws away every other partition's in-flight work to fix one,
+and because a crash loop is a blunter signal than a gauge that says exactly how many partitions
+are stuck.
+
+## `IsRetryable` and `IsCallerError` are separate questions
+
+"Should I try this again?" and "whose fault is this?" have different answers, and one classifier
+answering both produced a real bug: a malformed page token reached the client as a 500.
+
+`IsRetryable` has to end in a permissive catch-all, because on the write path an unrecognised
+error is most likely a transport failure and retrying is the safe default. That default is
+exactly wrong for status mapping, where an unrecognised error is *not* evidence that the caller
+was at fault.
+
+So they are two functions. The invariant tying them together is asserted rather than assumed:
+every caller error must also be non-retryable. The converse deliberately does not hold — plenty
+of errors are permanent *and* entirely our own doing, and a classifier that cannot say so blames
+the caller for our bugs.
+
+## Batching is a knob, defaulted to off
+
+Day 10 measured a single worker at ~1828 ev/s and reasoned that the ceiling was one database
+round trip per record. Day 13 measured batching at 41082 ev/s with a batch of 200 — a 21× move
+on the same database, which confirms the diagnosis.
+
+It still ships defaulted to 1. Every number in FINDINGS.md was measured against one insert per
+record, and changing the default would silently invalidate the whole record. A default of 1
+means the documented measurements stay reproducible and the improvement is an experiment
+somebody can run (`make batch-matrix`) rather than a claim they have to take on trust.
+
+There is also a real trade to make deliberately: a record waits for its whole batch, so
+per-record latency gets worse as throughput gets better. Which side of that trade is right
+depends on the workload, which is an argument for a knob rather than for a new default.
+
+## A failed batch falls back to one record at a time
+
+A multi-row `INSERT` is all-or-nothing, so a single poison record fails the whole chunk. Left
+there, batching would trade the poison isolation of Day 6 for throughput.
+
+On any batch failure the chunk is replayed record by record. The offender is isolated and
+dead-lettered, its neighbours persist, and the partition keeps moving — the Day 6 behaviour
+exactly, reached by a slower path only when something has already gone wrong.
+
+This depends on batches being genuinely atomic: if a failed batch could leave partial rows, the
+fallback would write them twice. That is asserted against real Postgres rather than assumed.
+
+`RETURNING event_id` is what keeps per-record accounting alive through a batch. A count of 7 out
+of 10 does not say *which* 7, and the persisted-versus-duplicate metric is built from precisely
+that distinction.
+
+## `Idempotency-Key` derives the identifiers instead of storing them
+
+`UNIQUE (event_id)` makes Kafka redelivering an event a no-op. It does nothing about a client
+that times out and retries its POST — that used to mint fresh ids and become a second real order.
+
+The obvious fix is a table of seen keys, which means a database write on the ingress path. That
+is exactly what this architecture exists to avoid: the API answers 202 without touching Postgres,
+and adding a lookup would put the write path back where it started.
+
+Deriving `order_id` and `event_id` from the key as UUIDv5 needs no storage at all. The retry
+produces an event the worker has *already* deduplicated on, so the guarantee is enforced by the
+same database constraint as everything else rather than by a second mechanism beside it.
+
+**What it costs:** first write wins. Nothing records what the first body was, so a client that
+reuses a key with a different order gets the original back rather than an error. Stripe returns a
+422 for that, and doing the same here needs the request stored alongside the key — the storage
+this design was chosen to avoid. The honest description is that this makes retries safe, not that
+it validates key reuse.
+
+## Services probe themselves; the image gets no curl
+
+The service images are distroless — no shell, no package manager, nothing to run a healthcheck
+with. The usual fix is a base image with curl in it.
+
+The binary is already in the image and can answer the question itself:
+`/service -healthcheck http://127.0.0.1:8080/readyz` exits 0 or 1, which is the entire
+`HEALTHCHECK` contract. No new attack surface, nothing to keep patched, and the probe is
+version-locked to the service by construction.
+
+It parses `os.Args` directly instead of using the `flag` package, because it must run before
+anything else in `main`. A container asked whether it is healthy should not first connect to
+Kafka and Postgres to find out.
+
+## Liveness and readiness answer different questions
+
+`/healthz` deliberately depends on nothing. If it checked Kafka, a broker outage would have the
+orchestrator restart every API instance — turning a degraded write path into no API at all, and
+adding a thundering herd of reconnects to an already unwell broker.
+
+`/readyz` deliberately depends on Kafka, because the API's job is to accept writes and it cannot
+accept a write the broker will not acknowledge. An instance that cannot reach Kafka should leave
+the load balancer rather than serve 503s.
+
+It says nothing about the query service. That asymmetry is the same one the whole system is built
+on: the query service being down costs reads, and the API stays useful for writes throughout —
+which is why it dials the query service lazily in the first place.
+
+## Configuration is validated at startup, not discovered at use
+
+`config.Load` returns an error and the services exit on it. An empty `KAFKA_BROKERS` used to
+surface several seconds into startup as a client error three layers from its cause; a DSN in
+`key=value` form failed somewhere inside pgx.
+
+The validation is deliberately about what cannot possibly work — no brokers, a broker with no
+port, a dead-letter topic equal to the source topic (which would have the worker consume its own
+dead letters in a loop) — rather than about what looks unusual. A configuration validator that
+rejects things which would have worked is worse than none.

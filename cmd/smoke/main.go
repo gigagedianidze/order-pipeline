@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
@@ -16,7 +17,11 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid configuration: %v\n", err)
+		os.Exit(1)
+	}
 	log := cfg.Logger("smoke")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

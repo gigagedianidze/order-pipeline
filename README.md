@@ -54,6 +54,22 @@ nothing else saturates first, and here something else did. Per-worker throughput
 workers are added, and 1828 ev/s for a single worker matches one serial database round trip per
 record almost exactly.
 
+**Batching** — the fix the scaling table implied, measured. One worker, draining a 48001-record
+backlog, `WORKER_BATCH_SIZE` the only variable.
+
+| Batch size | Throughput | vs. serial |
+|-----------:|-----------:|-----------:|
+| 1          | 1908 ev/s  | 1.0×       |
+| 10         | 13796 ev/s | 7.2×       |
+| 50         | 22203 ev/s | 11.6×      |
+| 200        | 41082 ev/s | 21.5×      |
+
+Batch=1 reproduces the 1828 ev/s above, which is what makes the rest of the column meaningful.
+The ceiling was the worker's per-record round trip, not partition count and not Postgres — the
+same database absorbed 21× the write rate once the round trips were amortised. It ships defaulted
+to 1 so every measurement on this page stays reproducible; `make batch-matrix` runs the
+experiment, and the trade it buys is per-record latency, since a record waits for its whole batch.
+
 **Overload** — 4 workers, 3 partitions, 15s at each rate.
 
 | Offered | 503s | Lost | Accept p99 | End-to-end p99 | Peak lag |
@@ -126,6 +142,21 @@ Validates, assigns an `order_id`, produces to Kafka keyed by that id, and return
 201, because nothing is persisted yet. Invalid bodies get 400 listing every problem at once; if
 the broker does not acknowledge, the client gets 503 rather than a false 202.
 
+Send an **`Idempotency-Key`** header to make your own retries safe. Both ids are derived from the
+key, so a retry after a timeout produces an event the worker has already deduplicated on rather
+than a second genuine order. Without the key, a retried POST *is* a new order.
+
+```sh
+# The same key twice: one order, and the worker logs "duplicate event ignored"
+curl -sX POST localhost:8080/orders \
+  -H 'Idempotency-Key: checkout-abc-123' \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"sku":"A","quantity":2,"unit_price_cents":1999}]}'
+```
+
+First write wins: reusing a key with a different body returns the original order, because nothing
+stores what the first body was.
+
 ### `GET /orders/{id}` and `GET /orders`
 
 The API calls the `query` service over gRPC. A 404 straight after a 202 is correct, not a bug —
@@ -138,6 +169,16 @@ curl -s "http://localhost:8080/orders?page_size=3&customer_id=cust-1"
 grpcurl -plaintext localhost:9090 list order.v1.OrderService
 grpcurl -plaintext -d '{"order_id":"<id>"}' localhost:9090 order.v1.OrderService/GetOrder
 ```
+
+### `GET /healthz` and `GET /readyz`
+
+Liveness depends on nothing — restarting a healthy API because the broker is down would turn a
+degraded write path into no API at all. Readiness depends on Kafka, because an API that cannot
+reach the broker cannot accept a write. Neither depends on the query service, whose absence costs
+reads and not writes.
+
+Compose wires `/readyz` as the container healthcheck. The images are distroless, so the probe is
+the service binary itself: `/service -healthcheck http://127.0.0.1:8080/readyz`.
 
 ---
 
@@ -178,7 +219,15 @@ histogram_quantile(0.99, sum by (le) (rate(order_processing_duration_seconds_buc
 
 # is the consumer group falling behind? (positive = yes)
 sum(deriv(kafka_consumergroup_lag{consumergroup="order-processors"}[1m]))
+
+# is any partition stuck? anything above 0 for more than a scrape or two is an alert
+sum(consumer_partitions_paused)
 ```
+
+`consumer_partitions_paused` is a gauge rather than a counter deliberately. A worker pauses a
+partition when a record can be neither persisted nor dead-lettered, and resumes it once the
+broker answers again; a cumulative count of pause *events* cannot tell a partition that recovered
+from one that never came back.
 
 Lag is exported twice on purpose: by the workers, and by `kafka-exporter` reading the broker.
 The workers' gauge goes stale at its last value when they die — reporting a healthy 0 while a
@@ -194,6 +243,7 @@ go build -o bin/loadgen.exe ./cmd/loadgen
 go run ./cmd/loadgen -rate 1000 -duration 30s   # steady load
 scripts/scaling-matrix.sh 3 1 2 4 8             # scaling matrix
 scripts/ramp.sh 1000 5000 20000                 # ramp until something breaks
+scripts/batch-matrix.sh 1 10 50 200             # does batching move the write ceiling?
 scripts/chaos-db-outage.sh                      # database gone for 90s
 scripts/chaos-kafka.sh                          # broker gone for 45s
 ```
@@ -216,7 +266,7 @@ cmd/worker     consumer group, idempotent persistence, retries, DLQ
 cmd/query      gRPC read service over PostgreSQL
 cmd/loadgen    load harness with a scheduled send rate
 cmd/smoke      connectivity check
-internal/      order domain, broker, store, retry policy, metrics, config
+internal/      order domain, broker, store, retry policy, metrics, config, healthcheck
 proto/         gRPC contract (generated code is committed)
 scripts/       experiment harnesses
 results/       recorded measurements and raw per-run reports
@@ -225,7 +275,18 @@ results/       recorded measurements and raw per-run reports
 ### Development
 
 ```sh
-go test ./...
+make test              # unit tests: no Docker, no network
+make test-integration  # store tests against the running Postgres (needs `make up`)
+make test-race         # under the race detector (needs cgo and a C toolchain)
+make help              # every target
+```
+
+The store's integration tests are gated on `POSTGRES_TEST_DSN` so `make test` stays hermetic.
+They exist because some claims only PostgreSQL can settle: that `ON CONFLICT` really makes
+redelivery a no-op, that a failed batch leaves no partial rows, and that keyset pagination stays
+stable while rows are inserted between pages.
+
+```sh
 
 protoc --proto_path=proto \
   --go_out=. --go_opt=module=github.com/gigagedianidze/order-pipeline \

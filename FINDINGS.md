@@ -735,3 +735,183 @@ Correctness survived every experiment run in this project. Nothing was ever lost
 the database, or silently dropped. The only thing any failure ever cost was time — except the
 broker, which costs availability, because it is the one component that has no queue in front of
 it.
+
+---
+
+## Day 13 — Mon 22 Sep (started 7 Sep)
+
+Hardening day. Two defects found by re-reading the code rather than by running it, the test
+suite extended to cover the invariants that were previously only checked by hand, and the one
+open question from Day 10 finally measured.
+
+### A paused partition was never resumed
+
+Day 4 established that a record which can be neither persisted nor dead-lettered must pause its
+partition, and Day 6 called that pause temporary — "until Kafka is reachable". Nothing ever made
+it temporary. `PauseFetchPartitions` was called and `ResumeFetchPartitions` appeared nowhere in
+the tree, and franz-go keeps a paused partition paused across rebalances, so the partition
+stayed dead until the process restarted.
+
+Worse, it stayed dead *quietly*. The process is healthy by every measure a supervisor can see,
+so `restart: unless-stopped` never fires. The only symptom is lag on one partition, and the only
+counter the worker exported was pause *events*, which cannot distinguish a partition that paused
+and recovered from one that never came back.
+
+The fix has three parts, and the second and third matter as much as the first:
+
+1. A `resumePaused` goroutine that un-pauses on a 15s tick.
+2. It runs on its **own goroutine**, not in the poll loop. `PollFetches` blocks; if every
+   partition is paused the poll loop is parked with nothing to fetch and could never resume
+   anything. The deadlock is only obvious once written down.
+3. It **pings the broker before resuming** rather than resuming blindly. Resuming into a
+   continuing outage re-pauses immediately, which is churn with nothing to show for it.
+
+`consumer_partitions_paused` is now a gauge, because the question is "is anything stuck right
+now" and no counter can answer it.
+
+### A bad page token was reported as a 500
+
+`ListOrders` with a malformed `page_token` returned `500 internal error`. The cause is a
+classifier answering a question it was never asked:
+
+```go
+if !store.IsRetryable(err) {          // "is this the caller's fault?"
+    return nil, status.Errorf(codes.InvalidArgument, ...)
+}
+```
+
+`IsRetryable` ends in a catch-all `return true` — anything that is not a `PgError` is assumed to
+be a transport failure, which is right for the write path and wrong here. A cursor decode error
+is not a `PgError`, so it was classified transient, so `!IsRetryable` was false, so the caller's
+mistake was logged as a server fault and returned as a 500.
+
+`TestDecodeCursorRejectsGarbage` passed throughout. It asserted that an error came back; it
+could not assert what the client would see.
+
+The fix is to stop conflating two questions. `ErrInvalidArgument` is a sentinel, `IsCallerError`
+is its own classifier, and a test pins the relationship that actually matters — every caller
+error must also be non-retryable, or the worker burns its whole budget on a record that was
+always going to be rejected. The reverse does not hold, and that asymmetry is the bug: plenty of
+errors are non-retryable *and* entirely our fault.
+
+### Batching moves the write ceiling by 21×
+
+Day 10 concluded that partition count was never the binding constraint, and that a single
+worker's ceiling was roughly 1/(database round trip) because records were processed one at a
+time. It named batching as the fix and did not test it. Now measured, one worker throughout,
+draining a 48001-record backlog:
+
+| Batch size | Drain span | Throughput | vs. serial |
+|-----------:|-----------:|-----------:|-----------:|
+| 1          | 25.16s     | 1908 ev/s  | 1.0×       |
+| 10         | 3.48s      | 13796 ev/s | 7.2×       |
+| 50         | 2.16s      | 22203 ev/s | 11.6×      |
+| 200        | 1.17s      | 41082 ev/s | 21.5×      |
+
+The batch=1 figure of 1908 ev/s reproduces Day 10's 1828–1922 ev/s, which is the control that
+makes the rest of the column meaningful.
+
+**The Day 10 diagnosis was right.** The ceiling was the per-record round trip, and amortising it
+moves that ceiling by more than an order of magnitude with no change to partition count, worker
+count, or the database. It is worth being precise about what this does and does not say: it says
+the *worker* was the constraint, not Postgres, because the same database absorbed 21× the write
+rate the moment the round trips were amortised.
+
+**Caveat on latency.** This measures drain throughput, not steady-state latency: every record sat
+in the topic while the backlog built, so end-to-end latency in this experiment is dominated by
+backlog age and cannot be compared across rows. Batching genuinely does trade per-record latency
+for throughput — a record waits for its whole batch — and `scripts/batch-matrix.sh` measures that
+trade properly, under live load rather than against a backlog.
+
+**It ships defaulted to 1.** Every measurement already in this file was taken against one insert
+per record, and silently changing the default would invalidate all of them. `WORKER_BATCH_SIZE`
+is the knob; `make batch-matrix` is the experiment.
+
+### Batching must not cost poison isolation
+
+A multi-row `INSERT` is all-or-nothing, so one poison record takes its whole chunk down with it.
+Without care, that trades a 21× throughput win for the loss of the property Day 6 was built
+around.
+
+The worker falls back to one record at a time whenever a batch fails, which isolates the offender
+and lets its neighbours through. That also preserves the named conflict target from Day 4: a
+genuine `order_id` collision still surfaces against exactly one record instead of being swallowed.
+Confirmed against real Postgres — `TestInsertOrdersIsAllOrNothing` checks that no row of a failed
+batch survives, which is what makes the fallback safe rather than a double-write.
+
+`RETURNING event_id` rather than a row count is what keeps per-record accounting possible: "7 of
+10 inserted" does not say *which* 7, and the duplicate metric is built from exactly that.
+
+### TIMESTAMPTZ is microseconds, and Go time is nanoseconds
+
+Found by an integration test failing on what looked like identical timestamps:
+
+```
+occurred_at = 2026-09-09 20:49:32.366048 -0400, want 2026-09-10 00:49:32.3660482 +0000
+```
+
+Same instant, one digit shorter. `TIMESTAMPTZ` stores microseconds and truncates the nanosecond
+tail. It costs nothing at this system's millisecond scale, and `EndToEndLatency` is measured from
+the in-memory event rather than the stored row, so nothing observable changes. Worth asserting
+deliberately rather than rediscovering later as a flaky test.
+
+### What the tests cover now, and why that is the point
+
+The suite went from 12 test functions over pure helpers to 72 (146 cases) over the parts that can
+actually be wrong. Every reliability claim in this file was previously backed by a manual chaos
+script and a reading of `kafka-consumer-groups.sh --describe` — a fine way to *discover* the Day 4
+offset bug and a poor way to keep it fixed. A refactor that broke commit ordering would have gone
+green.
+
+Making the poll loop testable was most of the work: `processPartition` now takes a slice of
+records and returns the last committable one plus whether the partition must stall, with the store
+and the dead-letter queue behind interfaces. The invariant is expressible in one sentence and now
+in one assertion.
+
+The tests that matter state an invariant rather than an implementation:
+
+- a failure at offset 22 commits offset 21 and no further — the Day 4 bug, now a test
+- a dead-lettered record does *not* block its partition, because it is accounted for
+- a constraint violation is attempted exactly once; a connection failure is attempted more
+- six deliveries of three records produce three rows and zero dead letters
+- a cancelled work context commits nothing, because shutdown must not claim work it did not do
+- a failed batch leaves no partial rows, which is what makes the per-record fallback safe
+
+The store tests run against real PostgreSQL, gated on `POSTGRES_TEST_DSN` so `make test` stays
+hermetic. Some claims only Postgres can answer: whether `ON CONFLICT` really makes redelivery a
+no-op, and whether keyset pagination is genuinely stable while rows are inserted underneath it
+(`TestListOrdersPaginationIsStableUnderInserts` inserts a row *between* every page, which is
+exactly what OFFSET cannot survive).
+
+### A client's retry was a second order
+
+The `UNIQUE (event_id)` constraint makes Kafka *redelivering* an event a no-op. It does nothing
+about a client that times out and re-POSTs — that retry minted fresh identifiers and became a
+second, genuine order. The gap had been stated for non-database side effects (Day 4) but not
+noticed at ingress, where it is the same gap.
+
+`Idempotency-Key` closes it with no new storage and no new code path: both `order_id` and
+`event_id` are derived from the key as UUIDv5, so a client's retry produces an event the worker
+has *already* deduplicated on. Measured end to end — two POSTs with the same key produce one row,
+and the worker logs `duplicate event ignored` for the second, which is the existing machinery
+doing the work rather than a new mechanism bolted alongside it.
+
+First write wins, and nothing here records what the first body was, so a client reusing a key with
+a different order gets the original back. Detecting that misuse needs the request stored alongside
+the key, which is a real design with real costs and is not what this buys.
+
+### The healthcheck problem distroless creates
+
+`/healthz` existed for eight days and no compose service used it, so nothing ever acted on it.
+Adding a healthcheck ran straight into the images being distroless: no shell, no curl, nothing to
+probe with.
+
+The binary already in the image can do it. `/service -healthcheck http://127.0.0.1:8080/readyz`
+exits 0 or 1, which is exactly the contract `HEALTHCHECK` wants, and costs no attack surface — the
+alternative is a fatter base image carrying curl solely to ask a question the binary can already
+answer.
+
+Liveness and readiness had to be split to make this safe. `/healthz` must **not** depend on Kafka:
+restarting a healthy API because the broker is down turns a partial outage into a total one.
+`/readyz` must: an API that cannot reach Kafka cannot accept a write. It deliberately says nothing
+about the query service, whose absence costs reads and not writes.

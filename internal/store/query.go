@@ -158,11 +158,14 @@ func encodeCursor(c cursor) string {
 func decodeCursor(token string) (cursor, error) {
 	b, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
-		return cursor{}, fmt.Errorf("invalid page token: %w", err)
+		return cursor{}, fmt.Errorf("%w: page token is not valid base64", ErrInvalidArgument)
 	}
 	var c cursor
 	if err := json.Unmarshal(b, &c); err != nil {
-		return cursor{}, fmt.Errorf("invalid page token: %w", err)
+		return cursor{}, fmt.Errorf("%w: page token is not a valid cursor", ErrInvalidArgument)
+	}
+	if c.OrderID == "" || c.ProcessedAt.IsZero() {
+		return cursor{}, fmt.Errorf("%w: page token is incomplete", ErrInvalidArgument)
 	}
 	return c, nil
 }

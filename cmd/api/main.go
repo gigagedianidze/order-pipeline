@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/gigagedianidze/order-pipeline/internal/broker"
 	"github.com/gigagedianidze/order-pipeline/internal/config"
 	orderv1 "github.com/gigagedianidze/order-pipeline/internal/gen/orderv1"
+	"github.com/gigagedianidze/order-pipeline/internal/healthcheck"
 	"github.com/gigagedianidze/order-pipeline/internal/metrics"
 	"github.com/gigagedianidze/order-pipeline/internal/order"
 
@@ -33,10 +35,30 @@ import (
 const (
 	maxBodyBytes = 1 << 20 // 1 MiB
 	readTimeout  = 3 * time.Second
+
+	// maxPageSize mirrors the query service's own ceiling. Clamping here as well
+	// keeps a hostile page_size from reaching the int32 on the wire, where it
+	// would silently wrap to a negative number.
+	maxPageSize = 500
 )
 
+// publisher is the write path's only dependency, narrowed to what the handler
+// uses so the handler can be tested without a broker.
+type publisher interface {
+	Publish(ctx context.Context, key string, value any) (partition int32, offset int64, err error)
+	Ping(ctx context.Context) error
+}
+
 func main() {
-	cfg := config.Load()
+	// Before anything else: a container asked to probe itself must not first
+	// connect to Kafka and Postgres.
+	healthcheck.RunIfRequested()
+
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid configuration: %v\n", err)
+		os.Exit(1)
+	}
 	log := cfg.Logger("api")
 
 	producer, err := broker.NewProducer(cfg.KafkaBrokers, cfg.KafkaTopic, log)
@@ -89,20 +111,53 @@ func main() {
 	log.Info("stopped")
 }
 
-func routes(producer *broker.Producer, orders orderv1.OrderServiceClient, log *slog.Logger) http.Handler {
+func routes(producer publisher, orders orderv1.OrderServiceClient, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /orders", createOrder(producer, log))
 	mux.HandleFunc("GET /orders/{id}", getOrder(orders, log))
 	mux.HandleFunc("GET /orders", listOrders(orders, log))
+
+	// Liveness: is this process running. It must not depend on anything else, or
+	// a broker outage would have the orchestrator restart a perfectly healthy API
+	// and turn a partial failure into a total one.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	// Readiness: can this process actually do its job. The API's job is to accept
+	// writes, and it cannot accept a write the broker will not acknowledge — so
+	// readiness is exactly "can I reach Kafka", and deliberately says nothing
+	// about the query service, whose absence costs reads and not writes.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := producer.Ping(ctx); err != nil {
+			log.Warn("readiness check failed", "err", err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"status": "not ready",
+				"reason": "kafka unreachable",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 	return mux
 }
 
-func createOrder(producer *broker.Producer, log *slog.Logger) http.HandlerFunc {
+func createOrder(producer publisher, log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
+		// An Idempotency-Key makes a client's own retry safe. Without one, a
+		// client that times out and re-POSTs creates a second genuine order —
+		// the event_id dedup in the worker only covers Kafka redelivering the
+		// same event, not a caller sending a new one.
+		idempotencyKey := r.Header.Get("Idempotency-Key")
+		if err := order.ValidateIdempotencyKey(idempotencyKey); err != nil {
+			metrics.OrdersRejected.WithLabelValues("validation").Inc()
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 
 		var req order.CreateRequest
 		dec := json.NewDecoder(r.Body)
@@ -118,7 +173,7 @@ func createOrder(producer *broker.Producer, log *slog.Logger) http.HandlerFunc {
 			return
 		}
 
-		evt := order.NewEvent(req)
+		evt := order.NewEvent(req, idempotencyKey)
 
 		// Partition key is the order id, so all events for one order land on one
 		// partition and are processed in order by exactly one consumer.
@@ -141,6 +196,7 @@ func createOrder(producer *broker.Producer, log *slog.Logger) http.HandlerFunc {
 			"partition", partition,
 			"offset", offset,
 			"total_cents", evt.TotalCents,
+			"idempotent", idempotencyKey != "",
 		)
 
 		// 202, not 201: the order is durably queued, not yet persisted. A client
@@ -171,13 +227,14 @@ func listOrders(orders orderv1.OrderServiceClient, log *slog.Logger) http.Handle
 		ctx, cancel := context.WithTimeout(r.Context(), readTimeout)
 		defer cancel()
 
-		pageSize, err := strconv.Atoi(r.URL.Query().Get("page_size"))
+		pageSize, err := parsePageSize(r.URL.Query().Get("page_size"))
 		if err != nil {
-			pageSize = 0 // let the query service apply its default
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
 		}
 
 		res, err := orders.ListOrders(ctx, &orderv1.ListOrdersRequest{
-			PageSize:   int32(pageSize),
+			PageSize:   pageSize,
 			PageToken:  r.URL.Query().Get("page_token"),
 			CustomerId: r.URL.Query().Get("customer_id"),
 		})
@@ -195,6 +252,26 @@ func listOrders(orders orderv1.OrderServiceClient, log *slog.Logger) http.Handle
 			"next_page_token": res.GetNextPageToken(),
 		})
 	}
+}
+
+// parsePageSize turns the query parameter into the int32 the RPC takes. Absent
+// means "use the service's default"; anything unusable is the caller's mistake
+// and is said so, rather than being quietly reinterpreted as the default.
+func parsePageSize(raw string) (int32, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("page_size must be a number")
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("page_size must not be negative")
+	}
+	if n > maxPageSize {
+		n = maxPageSize
+	}
+	return int32(n), nil
 }
 
 // writeGRPCError translates gRPC status codes into HTTP ones. Leaking a

@@ -1,6 +1,13 @@
 GO ?= go
 
-.PHONY: up down logs ps topics smoke build test clean reset
+# The compose stack already serves this DSN; the integration tests skip without it.
+POSTGRES_TEST_DSN ?= postgres://orders:orders@localhost:5433/orders?sslmode=disable
+
+.PHONY: help up down logs ps topics smoke build test test-race test-integration test-all \
+        load load-1k matrix ramp batch-matrix chaos-db chaos-kafka clean reset
+
+help:          ## list the targets
+	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | expand -t14
 
 up:            ## start Kafka + Postgres and create topics
 	docker compose up -d
@@ -36,6 +43,9 @@ matrix:        ## scaling matrix: 3 partitions, 1/2/4/8 workers
 ramp:          ## ramp offered load until something breaks
 	bash scripts/ramp.sh 1000 2500 5000 10000 20000
 
+batch-matrix:  ## does batching move the write ceiling? 1/10/50/200 records per round trip
+	bash scripts/batch-matrix.sh 1 10 50 200
+
 chaos-db:      ## remove PostgreSQL for 90s under load
 	bash scripts/chaos-db-outage.sh
 
@@ -45,8 +55,16 @@ chaos-kafka:   ## remove the broker for 45s under load
 build:
 	$(GO) build ./...
 
-test:
+test:          ## unit tests: no Docker, no network
 	$(GO) test ./...
+
+test-race:     ## unit tests under the race detector (needs cgo and a C toolchain)
+	CGO_ENABLED=1 $(GO) test -race ./...
+
+test-integration: ## store tests against the running Postgres (needs `make up`)
+	POSTGRES_TEST_DSN="$(POSTGRES_TEST_DSN)" $(GO) test -count=1 ./internal/store/
+
+test-all: test test-integration ## everything that can run locally
 
 clean:
 	rm -rf bin

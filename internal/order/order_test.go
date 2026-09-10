@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func TestValidate(t *testing.T) {
@@ -72,7 +74,7 @@ func TestNewEventTotal(t *testing.T) {
 			{SKU: "A", Quantity: 2, UnitPriceCents: 1999}, // 3998
 			{SKU: "B", Quantity: 3, UnitPriceCents: 500},  // 1500
 		},
-	})
+	}, "")
 
 	if want := int64(5498); evt.TotalCents != want {
 		t.Errorf("total = %d, want %d", evt.TotalCents, want)
@@ -90,7 +92,7 @@ func TestNewEventTotal(t *testing.T) {
 func TestNewEventIDsAreDistinct(t *testing.T) {
 	req := CreateRequest{CustomerID: "c", Items: []Item{{SKU: "A", Quantity: 1, UnitPriceCents: 1}}}
 
-	a, b := NewEvent(req), NewEvent(req)
+	a, b := NewEvent(req, ""), NewEvent(req, "")
 
 	if a.EventID == a.OrderID {
 		t.Error("event_id and order_id are identical")
@@ -100,5 +102,82 @@ func TestNewEventIDsAreDistinct(t *testing.T) {
 	}
 	if a.EventID == b.EventID {
 		t.Error("two requests produced the same event_id")
+	}
+}
+
+// An Idempotency-Key must produce the same identifiers every time, because that
+// is the entire mechanism: the client's retry becomes a redelivery of an event
+// the worker has already deduplicated on, rather than a second genuine order.
+func TestIdempotencyKeyProducesStableIDs(t *testing.T) {
+	req := CreateRequest{CustomerID: "c", Items: []Item{{SKU: "A", Quantity: 1, UnitPriceCents: 1}}}
+
+	a := NewEvent(req, "checkout-1")
+	b := NewEvent(req, "checkout-1")
+
+	if a.OrderID != b.OrderID {
+		t.Errorf("order_id differs between two uses of the same key: %s vs %s", a.OrderID, b.OrderID)
+	}
+	if a.EventID != b.EventID {
+		t.Errorf("event_id differs between two uses of the same key: %s vs %s", a.EventID, b.EventID)
+	}
+	if a.OrderID == a.EventID {
+		t.Error("order_id and event_id derived to the same value")
+	}
+	if _, err := uuid.Parse(a.OrderID); err != nil {
+		t.Errorf("derived order_id is not a UUID: %v", err)
+	}
+	if _, err := uuid.Parse(a.EventID); err != nil {
+		t.Errorf("derived event_id is not a UUID: %v", err)
+	}
+}
+
+func TestDifferentIdempotencyKeysProduceDifferentOrders(t *testing.T) {
+	req := CreateRequest{CustomerID: "c", Items: []Item{{SKU: "A", Quantity: 1, UnitPriceCents: 1}}}
+
+	a := NewEvent(req, "checkout-1")
+	b := NewEvent(req, "checkout-2")
+
+	if a.OrderID == b.OrderID {
+		t.Error("two different keys produced the same order_id")
+	}
+}
+
+// The key changes the identifiers and nothing else. If it altered the totals or
+// the payload it would be a pricing bug waiting to happen.
+func TestIdempotencyKeyDoesNotChangeTheOrder(t *testing.T) {
+	req := CreateRequest{
+		CustomerID: "cust-1",
+		Items:      []Item{{SKU: "A", Quantity: 2, UnitPriceCents: 1999}},
+	}
+
+	keyed, unkeyed := NewEvent(req, "checkout-1"), NewEvent(req, "")
+
+	if keyed.TotalCents != unkeyed.TotalCents {
+		t.Errorf("total differs: %d vs %d", keyed.TotalCents, unkeyed.TotalCents)
+	}
+	if keyed.CustomerID != unkeyed.CustomerID || keyed.EventType != unkeyed.EventType {
+		t.Error("the key altered something other than the identifiers")
+	}
+}
+
+func TestValidateIdempotencyKey(t *testing.T) {
+	valid := []string{"", "abc-123", "order:42", strings.Repeat("k", MaxIdempotencyKeyLen)}
+	for _, key := range valid {
+		if err := ValidateIdempotencyKey(key); err != nil {
+			t.Errorf("ValidateIdempotencyKey(%q) = %v, want nil", key, err)
+		}
+	}
+
+	invalid := []string{
+		strings.Repeat("k", MaxIdempotencyKeyLen+1),
+		"has a space",
+		"tab\there",
+		"null\x00byte",
+		"emoji-\U0001F600",
+	}
+	for _, key := range invalid {
+		if err := ValidateIdempotencyKey(key); err == nil {
+			t.Errorf("ValidateIdempotencyKey(%q) accepted an unusable key", key)
+		}
 	}
 }

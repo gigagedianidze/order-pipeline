@@ -84,6 +84,15 @@ services:
     depends_on:
       kafka-init:
         condition: service_completed_successfully
+    # /readyz asks whether the API can reach Kafka, which is the only thing it
+    # needs to do its job. The distroless image has no shell and no curl, so the
+    # check is the service's own binary — every image already carries it.
+    healthcheck:
+      test: ["CMD", "/service", "-healthcheck", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
     restart: unless-stopped
 
   query:
@@ -101,6 +110,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/service", "-healthcheck", "tcp://127.0.0.1:9090"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
     restart: unless-stopped
 
   worker:
@@ -113,6 +128,9 @@ services:
       KAFKA_BROKERS: kafka:19092
       POSTGRES_DSN: postgres://orders:orders@postgres:5432/orders?sslmode=disable
       METRICS_ADDR: ":2112"
+      # Records per database round trip. 1 reproduces every measurement already
+      # in FINDINGS.md; override it to run the batching experiment.
+      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-1}
     depends_on:
       kafka-init:
         condition: service_completed_successfully

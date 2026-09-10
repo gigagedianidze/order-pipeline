@@ -77,20 +77,78 @@ func (r CreateRequest) Validate() error {
 	return nil
 }
 
+// idempotencyNamespace seeds the deterministic ids derived from a client's
+// Idempotency-Key. It is a fixed, arbitrary UUID: its only job is to keep this
+// system's derived ids from colliding with ids derived elsewhere from the same
+// key material.
+var idempotencyNamespace = uuid.MustParse("6f9619ff-8b86-d011-b42d-00c04fc964ff")
+
+// MaxIdempotencyKeyLen bounds what a client may send. The key is hashed, so
+// length costs nothing here — the limit exists so a caller cannot use the header
+// as a megabyte-sized channel into our logs.
+const MaxIdempotencyKeyLen = 255
+
 // NewEvent turns a validated request into a publishable event. Money is handled
 // in integer cents throughout — floats and currency do not mix.
-func NewEvent(r CreateRequest) Event {
+//
+// idempotencyKey, when non-empty, makes the identifiers deterministic: the same
+// key always produces the same OrderID and EventID. That closes a real hole. The
+// UNIQUE (event_id) constraint makes *redelivery* a no-op, but it does nothing
+// about a client that times out and retries its POST — that retry used to mint
+// fresh ids and become a second, genuine order. Deriving the ids from the
+// client's key routes the retry into exactly the same deduplication the worker
+// already performs, with no new storage and no new code path.
+//
+// EventID and OrderID are derived from different strings so they do not collide
+// with each other, and both from the same key so a retry lands on both.
+//
+// First write wins: a client that reuses a key with a different body gets the
+// original order, because nothing here records what the first body was. Detecting
+// that misuse would need the request stored alongside the key, which is a real
+// design with real costs and is not what this buys.
+func NewEvent(r CreateRequest, idempotencyKey string) Event {
 	var total int64
 	for _, it := range r.Items {
 		total += it.UnitPriceCents * int64(it.Quantity)
 	}
+
+	orderID, eventID := uuid.NewString(), uuid.NewString()
+	if idempotencyKey != "" {
+		orderID = derive("order:" + idempotencyKey)
+		eventID = derive("event:" + idempotencyKey)
+	}
+
 	return Event{
-		EventID:    uuid.NewString(),
+		EventID:    eventID,
 		EventType:  EventTypeCreated,
-		OrderID:    uuid.NewString(),
+		OrderID:    orderID,
 		OccurredAt: time.Now().UTC(),
 		CustomerID: r.CustomerID,
 		Items:      r.Items,
 		TotalCents: total,
 	}
+}
+
+// derive produces a stable UUIDv5 for a string.
+func derive(s string) string {
+	return uuid.NewSHA1(idempotencyNamespace, []byte(s)).String()
+}
+
+// ValidateIdempotencyKey rejects a key the API should not accept. An empty key
+// is not an error — it simply means the client is not asking for the guarantee.
+func ValidateIdempotencyKey(key string) error {
+	if key == "" {
+		return nil
+	}
+	if len(key) > MaxIdempotencyKeyLen {
+		return fmt.Errorf("%w: Idempotency-Key must be at most %d characters", ErrInvalid, MaxIdempotencyKeyLen)
+	}
+	for _, r := range key {
+		// Printable ASCII only. The key reaches logs and Kafka headers, and a
+		// control character in either is somebody else's bug to debug.
+		if r < 0x21 || r > 0x7e {
+			return fmt.Errorf("%w: Idempotency-Key must be printable ASCII without spaces", ErrInvalid)
+		}
+	}
+	return nil
 }

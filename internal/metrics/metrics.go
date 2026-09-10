@@ -87,6 +87,18 @@ var (
 		Help: "Partitions currently assigned to this worker.",
 	})
 
+	// PartitionsPaused is the number of partitions this worker has stopped
+	// fetching from because a record could be neither persisted nor parked.
+	//
+	// A gauge, not a counter, because the question is "is anything stuck right
+	// now" — a cumulative count of pause events cannot answer that, and a
+	// partition that pauses and recovers looks identical to one that never came
+	// back. Anything above zero for more than a scrape or two is an alert.
+	PartitionsPaused = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "consumer_partitions_paused",
+		Help: "Partitions this worker has paused after failing to persist and to dead-letter.",
+	})
+
 	Retries = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "retries_total",
 		Help: "Write attempts retried after a transient failure.",

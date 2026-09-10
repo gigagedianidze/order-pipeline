@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/gigagedianidze/order-pipeline/internal/config"
 	orderv1 "github.com/gigagedianidze/order-pipeline/internal/gen/orderv1"
+	"github.com/gigagedianidze/order-pipeline/internal/healthcheck"
 	"github.com/gigagedianidze/order-pipeline/internal/metrics"
 	"github.com/gigagedianidze/order-pipeline/internal/store"
 
@@ -29,13 +31,21 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	// Before anything else: a container asked to probe itself must not first
+	// connect to Kafka and Postgres.
+	healthcheck.RunIfRequested()
+
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid configuration: %v\n", err)
+		os.Exit(1)
+	}
 	log := cfg.Logger("query")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	db, err := store.New(ctx, cfg.PostgresDSN)
+	db, err := store.New(ctx, cfg.PostgresDSN, cfg.PostgresMaxConns)
 	if err != nil {
 		log.Error("connect postgres", "err", err)
 		os.Exit(1)
@@ -118,7 +128,11 @@ func (s *server) GetOrder(ctx context.Context, req *orderv1.GetOrderRequest) (*o
 	if err != nil {
 		// A malformed UUID reaches Postgres and comes back as 22P02. That is the
 		// caller's mistake, so it must not be reported as an internal error.
-		if !store.IsRetryable(err) {
+		//
+		// Asked with IsCallerError, not with !IsRetryable: plenty of errors are
+		// non-retryable *and* entirely our fault, and conflating the two blames
+		// the caller for our bugs.
+		if store.IsCallerError(err) {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid order_id: %s", req.GetOrderId())
 		}
 		s.log.Error("get order", "order_id", req.GetOrderId(), "err", err)
@@ -130,7 +144,10 @@ func (s *server) GetOrder(ctx context.Context, req *orderv1.GetOrderRequest) (*o
 func (s *server) ListOrders(ctx context.Context, req *orderv1.ListOrdersRequest) (*orderv1.ListOrdersResponse, error) {
 	orders, next, err := s.db.ListOrders(ctx, int(req.GetPageSize()), req.GetPageToken(), req.GetCustomerId())
 	if err != nil {
-		if !store.IsRetryable(err) {
+		// A bad page_token is the caller's mistake and used to surface as a 500,
+		// because the old classifier's catch-all treated any non-Postgres error
+		// as transient.
+		if store.IsCallerError(err) {
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
 		s.log.Error("list orders", "err", err)

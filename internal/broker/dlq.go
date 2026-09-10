@@ -74,4 +74,8 @@ func (d *DLQ) Send(ctx context.Context, rec *kgo.Record, reason Reason, cause er
 	return nil
 }
 
+// Ping reports whether the dead-letter topic's brokers are reachable. The worker
+// asks this before un-pausing a partition it paused because the DLQ was down.
+func (d *DLQ) Ping(ctx context.Context) error { return d.producer.Ping(ctx) }
+
 func (d *DLQ) Close() { d.producer.Close() }

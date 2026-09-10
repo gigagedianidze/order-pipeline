@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -36,9 +37,26 @@ func TestCursorIsURLSafe(t *testing.T) {
 }
 
 func TestDecodeCursorRejectsGarbage(t *testing.T) {
-	for _, token := range []string{"not-base64!!", "aGVsbG8", ""} {
-		if _, err := decodeCursor(token); err == nil {
+	tokens := []string{
+		"not-base64!!",    // not base64 at all
+		"aGVsbG8",         // valid base64, not JSON
+		"",                // empty
+		"e30",             // valid base64 of "{}": JSON, but not a cursor
+		"eyJvIjoiYWJjIn0", // has an order id, no timestamp
+	}
+	for _, token := range tokens {
+		_, err := decodeCursor(token)
+		if err == nil {
 			t.Errorf("decodeCursor(%q) accepted invalid token", token)
+			continue
+		}
+		// The classification is the point: a bad token is the caller's mistake,
+		// and reporting it as anything else turns a 400 into a 500.
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("decodeCursor(%q) error is not ErrInvalidArgument: %v", token, err)
+		}
+		if IsRetryable(err) {
+			t.Errorf("decodeCursor(%q) error is classified retryable", token)
 		}
 	}
 }

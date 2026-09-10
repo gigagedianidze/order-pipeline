@@ -3,10 +3,19 @@ package store
 import (
 	"context"
 	"errors"
-	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// ErrInvalidArgument marks a failure caused by the caller's input rather than by
+// the system: a malformed page token, an order id that is not a UUID.
+//
+// It exists because "should I retry this?" and "whose fault is this?" are two
+// different questions, and answering the second with the first is how a bad page
+// token turns into a 500. IsRetryable classifies the *environment*; this
+// classifies the *request*. A caller error is never retryable, but plenty of
+// non-retryable errors are our fault and must not be blamed on the caller.
+var ErrInvalidArgument = errors.New("invalid argument")
 
 // IsRetryable decides whether a failed write is worth attempting again.
 //
@@ -24,6 +33,10 @@ func IsRetryable(err error) bool {
 	}
 	// Shutdown is not a failure to retry — the drain deadline decides, not this.
 	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	// The caller handed us something unusable. Retrying cannot change that.
+	if errors.Is(err, ErrInvalidArgument) {
 		return false
 	}
 	// A statement timeout is the database saying "not now", which is transient.
@@ -55,8 +68,21 @@ func IsRetryable(err error) bool {
 	// Not a PgError at all: the failure happened below the protocol — connection
 	// refused, DNS, TCP reset, a closed pool. Those are exactly the transient
 	// class. pgx reports a shut-down server this way rather than as a PgError.
-	if strings.Contains(err.Error(), "closed pool") {
+	return true
+}
+
+// IsCallerError reports whether err is the caller's fault. Transport-level
+// failures deliberately do not qualify: an unreachable database is our problem
+// to solve, not something to blame on whoever asked.
+func IsCallerError(err error) bool {
+	if errors.Is(err, ErrInvalidArgument) {
 		return true
 	}
-	return true
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// 22 is a data exception — the classic case is 22P02, a value that is not
+		// a valid UUID reaching Postgres because the caller sent nonsense.
+		return pgErr.Code[:2] == "22"
+	}
+	return false
 }

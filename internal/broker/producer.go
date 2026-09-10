@@ -47,19 +47,11 @@ func (p *Producer) Publish(ctx context.Context, key string, value any) (partitio
 	if err != nil {
 		return 0, 0, fmt.Errorf("marshal event: %w", err)
 	}
-
-	rec := &kgo.Record{
+	return p.PublishRecord(ctx, &kgo.Record{
 		Topic: p.topic,
 		Key:   []byte(key), // partition key: same key -> same partition -> ordered
 		Value: payload,
-	}
-
-	res := p.client.ProduceSync(ctx, rec)
-	if err := res.FirstErr(); err != nil {
-		return 0, 0, fmt.Errorf("produce: %w", err)
-	}
-	r := res[0].Record
-	return r.Partition, r.Offset, nil
+	})
 }
 
 // PublishRecord sends an already-built record, letting the caller set headers
@@ -74,6 +66,15 @@ func (p *Producer) PublishRecord(ctx context.Context, rec *kgo.Record) (partitio
 	}
 	r := res[0].Record
 	return r.Partition, r.Offset, nil
+}
+
+// Ping reports whether the brokers are reachable. It is a metadata round trip,
+// not a produce, so it answers "is Kafka there" without writing anything.
+func (p *Producer) Ping(ctx context.Context) error {
+	if err := p.client.Ping(ctx); err != nil {
+		return fmt.Errorf("ping kafka: %w", err)
+	}
+	return nil
 }
 
 // Close flushes buffered records and shuts the client down.
