@@ -254,6 +254,20 @@ CONSOLE_PASSWORD_HASH='$2a$10$...' make console
 # -> http://localhost:8081
 ```
 
+On Windows without GNU make, the same thing in PowerShell. Note the **single** quotes on the
+hash: it contains `$` and PowerShell would expand `$2a` to nothing inside double quotes, leaving
+a hash that silently never matches any password.
+
+```powershell
+$env:CONSOLE_PASSWORD = 'something long and not guessable'
+go run ./cmd/console -hash
+# CONSOLE_PASSWORD_HASH=$2a$10$...
+
+$env:CONSOLE_PASSWORD_HASH = '$2a$10$...'
+go run ./cmd/console
+# -> http://localhost:8081
+```
+
 It runs on the host rather than in Compose, holds no pipeline credentials, and never connects to
 Kafka or Postgres: it shells out to the same commands an operator would type and reads metrics
 over HTTP. That separation is the point — it stays up and keeps reporting while the stack it is
