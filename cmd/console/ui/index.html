@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order Pipeline Console</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#9889;</text></svg>">
+<link rel="stylesheet" href="/static/console.css">
+</head>
+<body>
+
+<div id="login" class="gate" hidden>
+  <form id="login-form" class="card gate-card">
+    <h1>Order Pipeline</h1>
+    <p class="muted">Control surface. Everything behind this page starts, stops or breaks a running system.</p>
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <button type="submit" class="primary">Sign in</button>
+    <p id="login-error" class="error" hidden></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <strong>Order Pipeline</strong>
+      <span class="muted">console</span>
+    </div>
+    <div id="stack-summary" class="stack-summary"></div>
+    <button id="logout" class="ghost">Sign out</button>
+  </header>
+
+  <main>
+    <section class="card controls">
+      <div class="card-head">
+        <h2>Controls</h2>
+        <div id="run-status" class="run-status"></div>
+      </div>
+      <div id="controls"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Live</h2>
+        <span id="prom-status" class="muted"></span>
+      </div>
+      <div id="charts" class="charts"></div>
+      <div id="tiles" class="tiles"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Containers</h2>
+      </div>
+      <div id="containers" class="containers"></div>
+    </section>
+
+    <section class="card output-card">
+      <div class="card-head">
+        <h2>Output</h2>
+        <div class="card-actions">
+          <label class="check"><input type="checkbox" id="follow" checked> follow</label>
+          <button id="stop" class="danger" disabled>Stop run</button>
+        </div>
+      </div>
+      <pre id="output" class="output" aria-live="polite"></pre>
+    </section>
+  </main>
+</div>
+
+<script src="/static/console.js"></script>
+</body>
+</html>

@@ -52,6 +52,12 @@ chaos-db:      ## remove PostgreSQL for 90s under load
 chaos-kafka:   ## remove the broker for 45s under load
 	bash scripts/chaos-kafka.sh
 
+console:       ## web control panel on http://localhost:8081 (needs CONSOLE_PASSWORD_HASH)
+	$(GO) run ./cmd/console
+
+console-hash:  ## print a bcrypt hash for the password in CONSOLE_PASSWORD
+	$(GO) run ./cmd/console -hash
+
 build:
 	$(GO) build ./...
 

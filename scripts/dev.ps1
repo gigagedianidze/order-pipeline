@@ -1,5 +1,5 @@
 # PowerShell mirror of the Makefile, for Windows hosts without GNU make.
-#   .\scripts\dev.ps1 up | down | reset | ps | logs | topics | smoke | build | test
+#   .\scripts\dev.ps1 up | down | reset | ps | logs | topics | smoke | build | test | console
 param([Parameter(Position = 0)][string]$Target = "help")
 
 $ErrorActionPreference = "Stop"
@@ -17,9 +17,11 @@ try {
         "load-1k" { go run ./cmd/loadgen -rate 1000 -duration 30s }
         "matrix"  { bash scripts/scaling-matrix.sh 3 1 2 4 8 }
         "ramp"    { bash scripts/ramp.sh 1000 2500 5000 10000 20000 }
+        "console"      { go run ./cmd/console }
+        "console-hash" { go run ./cmd/console -hash }
         "build"  { go build ./... }
         "test"   { go test ./... }
-        default  { "targets: up down reset ps logs topics smoke load load-1k matrix ramp build test" }
+        default  { "targets: up down reset ps logs topics smoke load load-1k matrix ramp console console-hash build test" }
     }
 }
 finally { Pop-Location }

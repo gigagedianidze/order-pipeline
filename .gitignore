@@ -2,3 +2,9 @@ bin/
 *.exe
 .env
 FINDINGS-scratch.md
+
+# Console-driven runs. They are demos, not recorded experiments: namespaced away
+# from results/ proper so pressing a button cannot overwrite the measurements
+# README.md's tables cite. See Env in cmd/console/action.go.
+results/console-*
+results/reports/console-*

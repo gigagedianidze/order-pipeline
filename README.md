@@ -8,7 +8,10 @@ number from a recorded experiment — the raw reports are in [`results/`](result
 in [FINDINGS.md](FINDINGS.md), and the reasoning behind each design choice in
 [DECISIONS.md](DECISIONS.md).
 
-There is no UI. This is a backend system, driven with `curl`, `grpcurl` and PromQL.
+This is a backend system, driven with `curl`, `grpcurl` and PromQL. A web console
+([`cmd/console`](cmd/console/)) puts the same experiments behind buttons and the same Prometheus
+behind a dashboard — it runs the commands documented below rather than replacing them, so every
+number on this page is reproducible without it.
 
 ```
   WRITE PATH (asynchronous)                    READ PATH (synchronous)
@@ -130,6 +133,7 @@ curl -s http://localhost:8080/orders/57e3745e-...
 | Kafka | `localhost:9092` | `kafka:19092` from inside Compose |
 | PostgreSQL | `localhost:5433` | 5432 inside; 5433 avoids clashing with a local install |
 | Prometheus | `localhost:9091` | expression browser |
+| console | `localhost:8081` | web control panel; loopback only, and behind a password |
 | metrics | `:2112` per service | scraped via Docker service discovery |
 
 ---
@@ -235,6 +239,81 @@ backlog grows — which is exactly when lag matters.
 
 ---
 
+## Console
+
+`cmd/console` is a web control panel for the same experiments: buttons that start and stop the
+stack, scale the consumer group, drive load at a chosen rate, take Postgres or Kafka away, and
+run the recorded matrices — with the command's output streaming live and a dashboard reading the
+same Prometheus as the PromQL above.
+
+```sh
+CONSOLE_PASSWORD='something long and not guessable' make console-hash
+# CONSOLE_PASSWORD_HASH=$2a$10$...
+
+CONSOLE_PASSWORD_HASH='$2a$10$...' make console
+# -> http://localhost:8081
+```
+
+It runs on the host rather than in Compose, holds no pipeline credentials, and never connects to
+Kafka or Postgres: it shells out to the same commands an operator would type and reads metrics
+over HTTP. That separation is the point — it stays up and keeps reporting while the stack it is
+pointed at is deliberately being broken, which is the only time a console really has to work.
+
+### Why the buttons are an allowlist
+
+A web page that can stop containers is, mechanically, remote command execution. The only thing
+separating this from a shell is that no command is ever assembled from what the client sent:
+
+- Every runnable command is an entry in `actions` in [`cmd/console/action.go`](cmd/console/action.go).
+  There is no "run an arbitrary make target" escape hatch, because the moment one exists the
+  allowlist is decorative.
+- `argv` is built from constants and handed to `exec.Command` as a slice. No shell is involved,
+  so there is no quoting to get wrong and no way for a parameter to become a second command.
+- Parameters are validated into a number or an enum member *first*, and it is the validated value
+  that gets formatted in. `TestValidateRejectsInjection` is the test that matters in that package:
+  every case is an attempt to smuggle something past validation, and every one must be refused
+  rather than sanitised.
+
+One run at a time, enforced by a lock. That is a correctness requirement, not a politeness one:
+these are experiments on a single shared stack, and a load run overlapping a chaos run produces
+numbers that describe neither.
+
+Console runs are also namespaced away from [`results/`](results/) proper, under `console-`. Every
+script writes to `results/reports/$TAG.txt`, defaulting to the tag its recorded experiment used —
+so without this, pressing "Kill the broker" during a demo would silently overwrite the very
+measurement the tables on this page cite, and nothing would show it but `git status`. Those files
+are gitignored: a button press is a demonstration, not a recorded result.
+
+### Reaching it from somewhere else
+
+`CONSOLE_ADDR` is loopback by default and should stay that way. To demo the system remotely,
+tunnel to it rather than binding it to a public interface — the buttons are then never on a
+listening port, and the machine needs no inbound firewall rule:
+
+```sh
+cloudflared tunnel --url http://localhost:8081
+```
+
+For a stable hostname, a named tunnel maps one to this port:
+
+```sh
+cloudflared tunnel login
+cloudflared tunnel create order-pipeline
+cloudflared tunnel route dns order-pipeline pipeline.example.com
+cloudflared tunnel run --url http://localhost:8081 order-pipeline
+```
+
+Set `CONSOLE_SECURE_COOKIE=true` and `CONSOLE_TRUSTED_PROXY=true` when doing this. The first marks
+the session cookie `Secure`; the second makes the login throttle key on `X-Forwarded-For` rather
+than on the tunnel's own address, without which every request looks like it came from the same
+client and the backoff is meaningless. Trusting that header when there is *no* proxy would be
+worse than not reading it at all, which is why it is off by default.
+
+The tunnel only exists while `cloudflared` is running, so the demo is reachable exactly as long
+as you choose.
+
+---
+
 ## Reproducing the experiments
 
 ```sh
@@ -265,6 +344,7 @@ cmd/api        HTTP ingress, Kafka producer, gRPC client
 cmd/worker     consumer group, idempotent persistence, retries, DLQ
 cmd/query      gRPC read service over PostgreSQL
 cmd/loadgen    load harness with a scheduled send rate
+cmd/console    web control panel: allowlisted commands, live dashboard
 cmd/smoke      connectivity check
 internal/      order domain, broker, store, retry policy, metrics, config, healthcheck
 proto/         gRPC contract (generated code is committed)
