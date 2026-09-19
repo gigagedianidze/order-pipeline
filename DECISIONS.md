@@ -280,6 +280,59 @@ from the source topic, so replaying it needs a special consumer that no one writ
 dead-letter queues quietly become write-only. Byte-identical records can be replayed by the
 same worker after the cause is fixed.
 
+## Replay is a command, not a service
+
+`cmd/replay` is run deliberately, drains what is on the dead-letter topic, and exits. The
+alternative — a long-lived consumer that follows `orders.dlq` and re-produces whatever appears —
+was rejected because it automates the one decision that should not be automatic. Records arrive
+on that topic precisely because the system could not decide what to do with them, and a process
+that immediately sends them back turns "this failed" into a retry loop with extra steps, running
+at whatever rate the failure produces.
+
+A command also makes the operational question answerable. `make dlq` reports what is there and
+what would be replayed without touching anything, because the first thing anyone wants from a
+dead-letter queue is to look at it, and a tool whose only mode is "act" will be run by someone
+who only wanted to look.
+
+It commits offsets only for records it has already produced back, which is the worker's rule for
+its own writes: an offset committed past a record that was never produced is that record deleted,
+and the dead-letter topic is the one place with no second copy.
+
+## Replay is filtered by reason, and counted
+
+The default replays only `retries_exhausted`. Poison has to be named explicitly with
+`-reason poison`.
+
+The two reasons exist because they call for different responses, and replay is where that
+distinction earns its keep. A record that failed on a database outage will probably succeed now.
+A record that failed on its own contents will fail identically, and replaying it produces a
+second dead letter, a second failure log line, and no progress.
+
+Each replayed record carries `replay_count`, and `DLQ.Send` carries that header forward when a
+record dies again, so the count survives the round trip. `-max-replays` (2) is what bounds the
+circuit: without it, a record that fails permanently but is classified as retryable — a database
+that stays down, say — would cycle `orders.dlq` → `orders` → `orders.dlq` forever, and the
+resulting traffic would look like the system doing work.
+
+## The replay verifies in PostgreSQL, not in Kafka
+
+A successful produce proves the record was handed back to the pipeline. It does not prove the
+worker picked it up, or that the row exists. Those are the claim.
+
+So `-verify` polls `SELECT count(*) FROM orders WHERE event_id = ANY(...)` for the replayed
+event ids until they are all present or the wait expires, and the command exits non-zero if any
+are missing. The number that ends the experiment is a row count in the database the orders were
+supposed to reach — not a count of messages produced, which is the number a replay tool can
+report while recovering nothing.
+
+## Why replaying is safe to run when unsure
+
+The write is idempotent on `event_id`, so a replayed record that did in fact land is a no-op
+rather than a duplicate order. This is the property that makes the whole recovery path usable:
+the operator does not have to work out which records were persisted before the outage swallowed
+the evidence, because replaying the ones that were costs nothing. It is the same invariant that
+makes at-least-once delivery survivable, applied to a human decision instead of a redelivery.
+
 ## Why gRPC is here at all
 
 The one-sentence justification, since the plan says to delete it if there isn't one:

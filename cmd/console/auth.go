@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,21 @@ import (
 )
 
 const sessionCookie = "console_session"
+
+const (
+	// failureTTL is how long an address's failure history outlives its last bad
+	// attempt. It has to exceed the longest backoff the throttle hands out,
+	// otherwise the record of why an address is locked could be swept away while
+	// the lock is still meant to be in force.
+	failureTTL = 15 * time.Minute
+
+	// maxTrackedIPs bounds the table. The console is reachable from the internet
+	// when it is tunnelled, and one attempt from each of a million addresses is a
+	// cheap way to make a process that keys a map by client address run out of
+	// memory. Guessing is what the throttle is for; the cap is what stops the
+	// throttle itself becoming the way in.
+	maxTrackedIPs = 4096
+)
 
 // auth is the console's login.
 //
@@ -35,6 +51,7 @@ type auth struct {
 type failure struct {
 	count int
 	until time.Time
+	seen  time.Time // last bad attempt, for expiry
 }
 
 func newAuth(cfg config) *auth {
@@ -157,12 +174,17 @@ func (a *auth) lockedFor(ip string) time.Duration {
 func (a *auth) recordFailure(ip string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	now := time.Now()
+	a.sweep(now)
+
 	f, ok := a.failures[ip]
 	if !ok {
 		f = &failure{}
 		a.failures[ip] = f
 	}
 	f.count++
+	f.seen = now
 	// The first two attempts are free; a typo should not be punished.
 	if f.count < 3 {
 		return
@@ -171,7 +193,47 @@ func (a *auth) recordFailure(ip string) {
 	if backoff > time.Minute {
 		backoff = time.Minute
 	}
-	f.until = time.Now().Add(backoff)
+	f.until = now.Add(backoff)
+}
+
+// sweep drops history that has stopped meaning anything, and enforces the cap.
+//
+// It runs on the failure path rather than on a timer: the only thing that grows
+// this table is a failed attempt, so the moment the table can grow is exactly the
+// moment to check it. A janitor goroutine would be a second thing to shut down
+// for a map that is empty on a console nobody is attacking.
+//
+// Eviction under pressure is oldest-first and does not spare an address that is
+// currently locked out. Losing a lock costs an attacker's address nothing worse
+// than starting the backoff again, and bcrypt still makes every guess expensive —
+// a table that is always bounded is worth more than a lock that is never lost.
+func (a *auth) sweep(now time.Time) {
+	for ip, f := range a.failures {
+		if now.Sub(f.seen) > failureTTL && now.After(f.until) {
+			delete(a.failures, ip)
+		}
+	}
+	if len(a.failures) < maxTrackedIPs {
+		return
+	}
+	// Evicting in one batch, rather than one entry per failed login, keeps the
+	// sort off the hot path: under a flood it runs once every few hundred
+	// attempts instead of on every one.
+	target := maxTrackedIPs * 9 / 10
+
+	type entry struct {
+		ip   string
+		seen time.Time
+	}
+	entries := make([]entry, 0, len(a.failures))
+	for ip, f := range a.failures {
+		entries = append(entries, entry{ip, f.seen})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].seen.Before(entries[j].seen) })
+
+	for i := 0; i < len(entries)-target; i++ {
+		delete(a.failures, entries[i].ip)
+	}
 }
 
 func (a *auth) clearFailures(ip string) {

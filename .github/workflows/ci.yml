@@ -1,0 +1,80 @@
+# The claims in the README are only worth as much as the tests behind them, and a
+# test suite that is only ever run on the author's laptop is a claim about the
+# laptop. This runs the hermetic suite on every push, and the store's integration
+# tests against a real PostgreSQL — they are the ones that settle what ON CONFLICT
+# and keyset pagination actually do, so skipping them in CI would leave the
+# interesting half unchecked.
+#
+# Deployment is deliberately not here: this repository builds and verifies, it
+# does not ship anywhere.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # gofmt is checked rather than applied: a formatting fix committed by CI is
+      # a commit nobody reviewed.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      # -race, not plain go test. The worker's counters and the rebalance
+      # callbacks are written from franz-go's own goroutines while the poll loop
+      # reads them; a data race there is exactly the kind of bug that passes on a
+      # quiet laptop and fails under load.
+      - name: test
+        run: go test -race ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: orders
+          POSTGRES_PASSWORD: orders
+          POSTGRES_DB: orders
+        ports:
+          - 5433:5432
+        # Without this the tests start dialling a database that is still booting,
+        # and the first run of the day fails for a reason that has nothing to do
+        # with the change being tested.
+        options: >-
+          --health-cmd "pg_isready -U orders"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The same DSN the compose stack serves, so the command is the one in the
+      # Makefile rather than a CI-only variant.
+      - name: store integration tests
+        env:
+          POSTGRES_TEST_DSN: postgres://orders:orders@localhost:5433/orders?sslmode=disable
+        run: go test -count=1 ./internal/store/

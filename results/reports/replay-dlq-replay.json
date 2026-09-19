@@ -1,0 +1,19 @@
+{
+  "dlq_topic": "orders.dlq",
+  "source_topic": "orders",
+  "reasons": "retries_exhausted",
+  "dry_run": false,
+  "max_replays": 2,
+  "scanned": 4,
+  "replayed": 4,
+  "failed": 0,
+  "unreadable": 0,
+  "skipped": {},
+  "seconds": 5.0344708,
+  "verify": {
+    "checked": 4,
+    "persisted": 4,
+    "missing": 0,
+    "wait_seconds": 0.0102739
+  }
+}

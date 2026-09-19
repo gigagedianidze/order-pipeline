@@ -98,6 +98,12 @@ Correctness survived every experiment. Nothing was lost, duplicated in the datab
 dropped. The broker is the only hard dependency, because it is the one component with no queue
 in front of it.
 
+A dead letter is a backlog, not a verdict. In the recorded recovery run, a 90-second outage — 45
+seconds past the retry budget — parked 4 records out of 150001, and `make replay` sent all 4 back
+through the ordinary pipeline: **150001 rows, 150001 distinct `event_id`s**, nothing lost and
+nothing duplicated. The rows appeared 0.01s after the replay produced them, because a replayed
+record is an ordinary record on the ordinary topic.
+
 ---
 
 ## Quickstart
@@ -208,6 +214,30 @@ Dead-lettered records keep their original key and value byte-for-byte so they ca
 the same worker; the diagnosis rides in headers (`dlq_reason`, `dlq_error`, `dlq_attempts`,
 `dlq_source_partition`, `dlq_source_offset`, `dlq_failed_at`).
 
+### Recovering the dead letters
+
+A dead letter is not a verdict, it is a backlog. Records tagged `retries_exhausted` were never
+wrong — the database was gone when their turn came — so recovery is producing those same bytes
+back into `orders` and letting the ordinary worker path finish.
+
+```sh
+make dlq      # what is on the dead-letter topic, and what would be replayed. Changes nothing.
+make replay   # send the recoverable ones back, then check the rows are in PostgreSQL
+```
+
+`cmd/replay` is a dry run unless given `-apply`, and it commits an offset only for a record it
+has already produced — the same rule the worker applies to its own writes, for the same reason.
+Three things make it safe to run when you are not sure:
+
+- **Idempotence.** The worker deduplicates on `event_id`, so replaying a record that *did* land
+  is a no-op rather than a duplicate order.
+- **A reason filter.** Poison records failed because of what they contain and would fail
+  identically; the default replays only `retries_exhausted`, and `-reason poison` has to be asked
+  for by name.
+- **A loop guard.** Each replay stamps `replay_count`, the DLQ carries that header forward when a
+  record dies again, and `-max-replays` (2 by default) is what stops one permanent failure
+  becoming an endless `orders` → `orders.dlq` → `orders` circuit that looks like throughput.
+
 Workers log what they own after every rebalance (`now_owns=orders:[0 1]`) and a heartbeat every
 15s, so a worker that owns nothing — more workers than partitions — is visible rather than
 silent.
@@ -242,9 +272,9 @@ backlog grows — which is exactly when lag matters.
 ## Console
 
 `cmd/console` is a web control panel for the same experiments: buttons that start and stop the
-stack, scale the consumer group, drive load at a chosen rate, take Postgres or Kafka away, and
-run the recorded matrices — with the command's output streaming live and a dashboard reading the
-same Prometheus as the PromQL above.
+stack, scale the consumer group, drive load at a chosen rate, take Postgres or Kafka away, replay
+what that dead-lettered, and run the recorded matrices — with the command's output streaming live
+and a dashboard reading the same Prometheus as the PromQL above.
 
 ```sh
 CONSOLE_PASSWORD='something long and not guessable' make console-hash
@@ -323,6 +353,12 @@ than on the tunnel's own address, without which every request looks like it came
 client and the backoff is meaningless. Trusting that header when there is *no* proxy would be
 worse than not reading it at all, which is why it is off by default.
 
+The login is one bcrypt-hashed password with a per-address backoff after two failures. That
+backoff table is bounded — expired entries are swept and the oldest are evicted past a cap —
+because it is keyed by client address on a service that is reachable from the internet while the
+tunnel is up, and an unbounded map keyed by something the caller chooses is a way to exhaust the
+process rather than guess the password.
+
 The tunnel only exists while `cloudflared` is running, so the demo is reachable exactly as long
 as you choose.
 
@@ -339,6 +375,7 @@ scripts/ramp.sh 1000 5000 20000                 # ramp until something breaks
 scripts/batch-matrix.sh 1 10 50 200             # does batching move the write ceiling?
 scripts/chaos-db-outage.sh                      # database gone for 90s
 scripts/chaos-kafka.sh                          # broker gone for 45s
+scripts/replay-dlq.sh                           # break it past the retry budget, then recover
 ```
 
 The load generator schedules send times in advance from the target rate and measures latency
@@ -358,6 +395,7 @@ cmd/api        HTTP ingress, Kafka producer, gRPC client
 cmd/worker     consumer group, idempotent persistence, retries, DLQ
 cmd/query      gRPC read service over PostgreSQL
 cmd/loadgen    load harness with a scheduled send rate
+cmd/replay     returns dead-lettered records to the source topic, and verifies they land
 cmd/console    web control panel: allowlisted commands, live dashboard
 cmd/smoke      connectivity check
 internal/      order domain, broker, store, retry policy, metrics, config, healthcheck
@@ -374,6 +412,11 @@ make test-integration  # store tests against the running Postgres (needs `make u
 make test-race         # under the race detector (needs cgo and a C toolchain)
 make help              # every target
 ```
+
+Every push runs the same commands in GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+`gofmt`, `go vet`, `go build`, `go test -race`, and the store's integration tests against a real
+PostgreSQL service container. A suite that only ever runs on the author's laptop is a claim about
+the laptop.
 
 The store's integration tests are gated on `POSTGRES_TEST_DSN` so `make test` stays hermetic.
 They exist because some claims only PostgreSQL can settle: that `ON CONFLICT` really makes
@@ -393,7 +436,7 @@ protoc --proto_path=proto \
 ## Scope
 
 Deliberately excluded, to keep the system small enough to understand completely: Kubernetes,
-cloud deployment, multi-broker clusters, database replicas, CI/CD, Kafka transactions, auth, a
-schema registry, and a frontend. Each is a project in its own right and none would have made the
+cloud deployment, multi-broker clusters, database replicas, deployment pipelines, Kafka
+transactions, auth, a schema registry, and a frontend. Each is a project in its own right and none would have made the
 measurements above more informative. The reasoning for the choices that *were* made is in
 [DECISIONS.md](DECISIONS.md).

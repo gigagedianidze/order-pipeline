@@ -1,0 +1,31 @@
+{
+  "tag": "replay-dlq",
+  "target_rate": 1000,
+  "achieved_rate": 999.9956547145171,
+  "duration": "2m30s",
+  "wall_clock_seconds": 150.0016518,
+  "concurrency": 128,
+  "sent": 150001,
+  "accepted": 150001,
+  "failed": 0,
+  "scheduler_behind": 178,
+  "accept_latency": {
+    "count": 150001,
+    "missing": 0,
+    "p50_seconds": 0.0007306,
+    "p95_seconds": 0.0012633,
+    "p99_seconds": 0.0015528,
+    "max_seconds": 0.2911024
+  },
+  "end_to_end_latency": {
+    "count": 149997,
+    "missing": 4,
+    "p50_seconds": 45.549069,
+    "p95_seconds": 86.8695784,
+    "p99_seconds": 91.35224236,
+    "max_seconds": 93.373947
+  },
+  "status_codes": {
+    "202": 150001
+  }
+}

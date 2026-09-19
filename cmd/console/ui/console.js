@@ -92,6 +92,7 @@ const GROUP_TITLES = {
   stack: "Stack",
   load: "Load",
   chaos: "Chaos",
+  recovery: "Recovery",
   experiment: "Recorded experiments",
 };
 
@@ -102,7 +103,7 @@ async function loadActions() {
   const host = $("controls");
   host.textContent = "";
 
-  for (const group of ["stack", "load", "chaos", "experiment"]) {
+  for (const group of ["stack", "load", "chaos", "recovery", "experiment"]) {
     const inGroup = state.actions.filter((a) => a.group === group);
     if (!inGroup.length) continue;
 

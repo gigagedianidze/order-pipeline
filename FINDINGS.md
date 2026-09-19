@@ -915,3 +915,88 @@ Liveness and readiness had to be split to make this safe. `/healthz` must **not*
 restarting a healthy API because the broker is down turns a partial outage into a total one.
 `/readyz` must: an API that cannot reach Kafka cannot accept a write. It deliberately says nothing
 about the query service, whose absence costs reads and not writes.
+
+## Day 14 — Tue 23 Sep (started 7 Sep)
+
+Recovery day. Every previous experiment ended at the break and measured it; this one ends after
+the break is undone. The dead-letter queue has had a producer since Day 6 and no consumer, which
+is exactly the state in which a DLQ becomes a place orders go to be counted.
+
+### Recovering a database outage end to end: 4 dead letters, 4 rows, nothing duplicated
+
+`scripts/replay-dlq.sh`: 1000/s for 150s, Postgres removed for 90 seconds at t+20 — 45 seconds
+past the retry budget, so dead letters are guaranteed — then `cmd/replay` puts them back.
+
+| | |
+|---|---|
+| Accepted (202) | 150001 |
+| Persisted before the replay | 149997 |
+| Dead-lettered (`retries_exhausted`) | **4** |
+| Replayed | **4** |
+| Rows in `orders` after the replay | **150001** |
+| Distinct `event_id` | **150001** |
+| Distinct `order_id` | **150001** |
+
+The loadgen report is the interesting half of the setup: `MISSING 4 rows accepted but not
+persisted within the drain window`, after a 600-second drain. Those four were not slow, they were
+gone, and no amount of further waiting would have produced them.
+
+The replay itself took 5 seconds, four of which were the idle poll that proves the topic is
+drained. The verification then waited **0.01 seconds** for all four rows — the workers had
+already picked the records up and written them before the first `SELECT` ran. Recovery latency
+here is one poll interval, not a batch window, because the replayed records are ordinary records
+on the ordinary topic.
+
+```
+replayed  dlq_partition=1 dlq_offset=0  ->  partition=1 offset=205147  replay_count=1
+replayed  dlq_partition=1 dlq_offset=1  ->  partition=1 offset=205148  replay_count=1
+replayed  dlq_partition=2 dlq_offset=0  ->  partition=2 offset=203738  replay_count=1
+replayed  dlq_partition=2 dlq_offset=1  ->  partition=2 offset=203739  replay_count=1
+```
+
+Running it a second time scans **0** records. The replay consumes the dead-letter topic through
+a consumer group and commits an offset only for a record it has already produced back, so a
+rerun resumes rather than re-replaying — the same discipline the worker applies to its own
+writes, for the same reason.
+
+### The DLQ would have erased the evidence its own loop guard depends on
+
+`-max-replays` stops a record circulating `orders.dlq` → `orders` → `orders.dlq` forever, and it
+works by reading a `replay_count` header off the dead letter. Writing that header in the replay
+tool is the obvious half. The half that is easy to miss is that `DLQ.Send` built a *fresh* header
+list for every dead letter, so the second death of a replayed record would have dropped
+`replay_count` — the guard would have read 0 every time and never fired.
+
+Found while writing the tool, not while running it: a loop guard whose counter silently resets is
+indistinguishable from a working one until the day something fails permanently and the pipeline
+starts doing laps. `DLQ.Send` now carries the `replay_` headers forward and rewrites only the
+diagnosis, and `TestCarryForwardKeepsTheReplayProvenance` pins it.
+
+### Poison is not replayed by default, and that is a measured distinction
+
+Day 6 split dead letters into `poison` and `retries_exhausted` on the grounds that they call for
+different responses. Replay is where that split pays: `retries_exhausted` means the environment
+failed and the record is probably fine, `poison` means the record is the problem and sending it
+back produces an identical failure and a second dead letter.
+
+So the default reason filter is `retries_exhausted` and poison has to be named. A replay tool
+that treats the topic as one undifferentiated backlog would have put the poison records from Day
+6 straight back into the pipeline, and the only visible result would have been the DLQ refilling
+itself.
+
+### The login throttle was an unbounded map keyed by the caller's address
+
+Found by re-reading `cmd/console/auth.go`, not by running it. The console throttles failed logins
+per client address, in a map that was only ever pruned on a *successful* login. Expired entries
+were never swept.
+
+On loopback that is nothing. Behind the `cloudflared` tunnel the README documents, it is a
+process that grows by one map entry per address that touches `/api/login` — the defence against
+password guessing being the cheapest way to exhaust the box it defends. The sweep now runs on the
+failure path (the only path that grows the table), drops history older than 15 minutes, and
+evicts oldest-first past a 4096-address cap.
+
+Eviction deliberately does not spare an address that is currently locked out. Losing a lock costs
+an attacker nothing worse than restarting the backoff, and bcrypt still prices every guess; a
+table that is always bounded is worth more than a lock that is never lost.
+

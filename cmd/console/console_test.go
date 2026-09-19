@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -216,6 +217,51 @@ func TestLoginThrottleBacksOff(t *testing.T) {
 	}
 }
 
+// The throttle keys a map by client address, and the console is meant to be
+// reachable over a tunnel. One attempt from each of a million addresses must
+// therefore cost the process a bounded amount of memory, or the defence against
+// guessing becomes the way to take the console down.
+func TestLoginThrottleTableStaysBounded(t *testing.T) {
+	a := newAuth(testConfig())
+
+	for i := range maxTrackedIPs * 3 {
+		a.recordFailure(fmt.Sprintf("198.51.100.%d", i))
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.failures) > maxTrackedIPs {
+		t.Fatalf("tracking %d addresses, cap is %d", len(a.failures), maxTrackedIPs)
+	}
+}
+
+// History that has stopped meaning anything is dropped, and history that is still
+// in force is not: a sweep that expired a live lockout would hand an attacker a
+// free reset every time an unrelated address failed a login.
+func TestLoginThrottleForgetsStaleAddressesButKeepsLiveLockouts(t *testing.T) {
+	a := newAuth(testConfig())
+	now := time.Now()
+
+	a.failures["198.51.100.1"] = &failure{count: 1, seen: now.Add(-failureTTL - time.Minute)}
+	a.failures["198.51.100.2"] = &failure{count: 9, seen: now.Add(-time.Second), until: now.Add(time.Minute)}
+	// Locked a moment ago, but its lock has since expired and it has been quiet
+	// for longer than the retention window.
+	a.failures["198.51.100.3"] = &failure{
+		count: 9, seen: now.Add(-failureTTL - time.Hour), until: now.Add(-time.Hour)}
+
+	a.sweep(now)
+
+	if _, ok := a.failures["198.51.100.1"]; ok {
+		t.Error("an address with one stale failure is still tracked")
+	}
+	if _, ok := a.failures["198.51.100.3"]; ok {
+		t.Error("an expired lockout is still tracked")
+	}
+	if _, ok := a.failures["198.51.100.2"]; !ok {
+		t.Error("a live lockout was swept away; the address would be free to guess again")
+	}
+}
+
 // TestClientIPIgnoresForwardedHeaderWhenUntrusted. If X-Forwarded-For were
 // trusted unconditionally, an attacker would reset their own throttle by
 // changing the header on every attempt, which defeats the whole mechanism.
@@ -385,6 +431,39 @@ func TestConsoleRunsCannotOverwriteRecordedResults(t *testing.T) {
 // TestChaosActionsAreNamespaced pins the specific pairing that matters: an
 // action whose script writes to $TAG must also read back that same tag's file,
 // or the output pane silently shows a stale report from a previous run.
+// The inspect button and the replay button differ by one flag in argv, and only
+// one of them writes to a running pipeline. A visitor is invited to press the
+// first without thinking, so it must not be able to become the second.
+func TestInspectingTheDLQCannotReplayIt(t *testing.T) {
+	look, ok := actions["dlq.inspect"]
+	if !ok {
+		t.Fatal("no dlq.inspect action")
+	}
+	for _, arg := range look.argv(values{}, testConfig()) {
+		if arg == "-apply" {
+			t.Fatalf("the inspect button produces records: %v", look.argv(values{}, testConfig()))
+		}
+	}
+	if look.Destructive {
+		t.Error("inspecting changes nothing; asking for confirmation teaches the operator to click through")
+	}
+
+	replay, ok := actions["dlq.replay"]
+	if !ok {
+		t.Fatal("no dlq.replay action")
+	}
+	var applies bool
+	for _, arg := range replay.argv(values{}, testConfig()) {
+		applies = applies || arg == "-apply"
+	}
+	if !applies {
+		t.Error("the replay button is a dry run, so the button does nothing it claims to")
+	}
+	if !replay.Destructive {
+		t.Error("the replay button writes to the source topic without confirmation")
+	}
+}
+
 func TestChaosActionsAreNamespaced(t *testing.T) {
 	for _, id := range []string{"chaos.db", "chaos.kafka"} {
 		a, ok := actions[id]

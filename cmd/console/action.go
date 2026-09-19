@@ -264,6 +264,31 @@ var actions = map[string]action{
 			return []string{"bash", "scripts/chaos-kafka.sh"}
 		},
 	},
+	"dlq.inspect": {
+		ID:      "dlq.inspect",
+		Label:   "Inspect dead letters",
+		Group:   "recovery",
+		Summary: "What is on the dead-letter topic, and what would be replayed. Changes nothing.",
+		Timeout: 3 * time.Minute,
+		argv: func(values, config) []string {
+			return []string{"go", "run", "./cmd/replay"}
+		},
+	},
+	"dlq.replay": {
+		ID:    "dlq.replay",
+		Label: "Replay dead letters",
+		Group: "recovery",
+		Summary: "Send the recoverable dead letters back through the pipeline, " +
+			"then check the rows reached PostgreSQL.",
+		// It writes to the source topic. Nothing it does is unsafe — the write is
+		// idempotent and poison records are left alone — but a button that puts
+		// records back into a running system should say so before it does.
+		Destructive: true,
+		Timeout:     10 * time.Minute,
+		argv: func(values, config) []string {
+			return []string{"go", "run", "./cmd/replay", "-apply", "-verify", "60s"}
+		},
+	},
 	"experiment.matrix": {
 		ID:      "experiment.matrix",
 		Label:   "Scaling matrix",

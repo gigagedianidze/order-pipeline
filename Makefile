@@ -4,7 +4,8 @@ GO ?= go
 POSTGRES_TEST_DSN ?= postgres://orders:orders@localhost:5433/orders?sslmode=disable
 
 .PHONY: help up down logs ps topics smoke build test test-race test-integration test-all \
-        load load-1k matrix ramp batch-matrix chaos-db chaos-kafka clean reset
+        load load-1k matrix ramp batch-matrix chaos-db chaos-kafka console \
+        dlq replay replay-experiment clean reset
 
 help:          ## list the targets
 	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | expand -t14
@@ -51,6 +52,15 @@ chaos-db:      ## remove PostgreSQL for 90s under load
 
 chaos-kafka:   ## remove the broker for 45s under load
 	bash scripts/chaos-kafka.sh
+
+dlq:           ## show what is on the dead-letter topic; produces nothing, commits nothing
+	$(GO) run ./cmd/replay
+
+replay:        ## send the recoverable dead letters back through the pipeline and verify the rows
+	$(GO) run ./cmd/replay -apply
+
+replay-experiment: ## break the database past the retry budget, then recover what it dead-lettered
+	bash scripts/replay-dlq.sh
 
 console:       ## web control panel on http://localhost:8081 (needs CONSOLE_PASSWORD_HASH)
 	$(GO) run ./cmd/console

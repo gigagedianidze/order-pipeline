@@ -1,0 +1,13 @@
+time=2026-09-18T23:02:50.721-04:00 level=INFO msg="reading dead letters" service=replay from=orders.dlq to=orders group=order-dlq-replay reasons=retries_exhausted apply=false
+time=2026-09-18T23:02:50.739-04:00 level=INFO msg="partitions assigned" service=replay gained="orders.dlq:[0 1 2]" now_owns="orders.dlq:[0 1 2]"
+time=2026-09-18T23:02:55.744-04:00 level=INFO msg="replay finished" service=replay scanned=4 replayed=4 failed=0 dry_run=true
+time=2026-09-18T23:02:55.744-04:00 level=INFO msg="partitions revoked" service=replay gave_up="orders.dlq:[0 1 2]" now_owns=none
+
+=== dlq replay: orders.dlq -> orders ===
+mode             DRY RUN — nothing produced, nothing committed; rerun with -apply
+reasons          retries_exhausted   (max 2 replays per record)
+scanned                 4
+replayed                4
+took                  5.0s
+
+report written to results/reports/replay-dlq-dryrun.json
